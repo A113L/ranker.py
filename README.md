@@ -61,3 +61,26 @@ python ranker.py \
     -o <path_for_output_csv> \
     -t <top_k_rules_to_save>
 ```
+📊 **Output**
+
+The script generates two files:
+
+1. Ranking Report (rule_ranking_report.csv)
+
+This CSV contains all processed rules, their scores, and the final ranking.
+
+**Rank** - The rule's rank based on Combined_Score.
+
+**Combined_Score** - Calculated as (Effectiveness_Score * 10) + Uniqueness_Score.
+
+**Effectiveness_Score** - Count of generated passwords that matched the cracked list.
+
+**Uniqueness_Score** - Count of generated passwords that were NOT in the base wordlist.
+
+**Rule_Data** - The original Hashcat rule string.
+
+2. Optimized Rule File (rule_ranking_report.optimized.rule)
+
+This file is a ready-to-use Hashcat rule file containing the top K rules from the ranking, guaranteed to include the mandatory identity rule (:) at the top for maximum coverage.
+
+This file should be used in subsequent cracking attempts for maximal efficiency.
