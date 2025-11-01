@@ -450,7 +450,7 @@ void bfs_kernel(
 }}
 """
 
-# --- HELPER FUNCTIONS (Python - Unchanged) ---
+# --- HELPER FUNCTIONS (Python) ---
 
 def fnv1a_hash_32_cpu(data):
     """Calculates FNV-1a hash for a byte array."""
@@ -530,11 +530,11 @@ def encode_rule(rule_str, rule_id, max_args):
         pass
     elif rule_str[0] in ('s', '@', '^', '$', 'T', 'D'):
         if rule_str[0] in ('s'):
-             if len(rule_chars) >= 3:
+              if len(rule_chars) >= 3:
                 arg0 = np.uint32(rule_chars[1]) # e.g., 'a' in 'sab'
                 arg1 = np.uint32(rule_chars[2]) # e.g., 'b' in 'sab'
         elif rule_str[0] in ('^', '$', '@', 'T', 'D'):
-             if len(rule_chars) >= 2:
+              if len(rule_chars) >= 2:
                 arg0 = np.uint32(rule_chars[0]) # e.g., '^'
                 arg1 = np.uint32(rule_chars[1]) # e.g., '1'
     
@@ -566,6 +566,7 @@ def save_ranking_data(ranking_list, output_path):
 
     try:
         with open(ranking_output_path, 'w', newline='', encoding='utf-8') as f:
+            # Note: Key is 'Combined_Score' (Capital S)
             fieldnames = ['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 'Rule_Data']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -598,8 +599,14 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
         with open(csv_path, 'r', newline='', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                row['Combined_Score'] = int(row['Combined_Score'])
-                ranked_data.append(row)
+                # Ensure scores are integers when reading from CSV string fields
+                try:
+                    # FIX: Read the correct key 'Combined_Score' and convert to int
+                    row['Combined_Score'] = int(row['Combined_Score'])
+                    ranked_data.append(row)
+                except ValueError:
+                    # Skip row if score is not a valid integer
+                    continue
     except FileNotFoundError:
         print(f"❌ Error: Ranking CSV file not found at: {csv_path}")
         return
@@ -608,7 +615,8 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
         return
 
     # Sort by the score (descending) as a precaution
-    ranked_data.sort(key=lambda row: row['Combined_score'], reverse=True)
+    # FIX: Corrected key from 'Combined_score' to 'Combined_Score'
+    ranked_data.sort(key=lambda row: row['Combined_Score'], reverse=True)
 
     # Select Top K
     final_optimized_list = ranked_data[:top_k]
@@ -719,9 +727,9 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     current_word_buffer_idx = 0
     copy_events = [None, None] # To track the copy events for each buffer index
 
-    # C) Rule Input Buffer (small, non-pipelined copy is fast enough)
-    rules_np_batch = np.zeros(MAX_RULES_IN_BATCH * rule_size_in_int, dtype=np.uint32)
-    rules_in_g = cl.Buffer(context, mf.READ_ONLY, rules_np_batch.nbytes)
+    # C) Rule Input Buffer (Allocate for max batch size)
+    rule_batch_byte_size = MAX_RULES_IN_BATCH * rule_size_in_int * np.uint32().itemsize
+    rules_in_g = cl.Buffer(context, mf.READ_ONLY, rule_batch_byte_size)
 
     # D) Global Hash Map (RW for base wordlist check)
     global_hash_map_g = cl.Buffer(context, mf.READ_WRITE, global_hash_map_np.nbytes)
@@ -762,19 +770,19 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     mapped_uniqueness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     mapped_effectiveness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     
-    num_words_batch_next = 0 # Stores the count of the batch currently being processed
+    # Stores the count of the batch currently being executed
+    num_words_batch_exec = 0
     
     # Updated progress bar to show Unique and Cracked counts
     word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist from disk [Unique: 0 | Cracked: 0]", unit=" word")
 
     # A. Initial word batch load (Blocking: We need data for the first execution)
     try:
-        base_words_np_batch, num_words_batch_next, base_hashes_np_batch = next(word_iterator)
+        base_words_np_batch, num_words_batch_exec, base_hashes_np_batch = next(word_iterator)
         
         # Copy first batch synchronously (or wait for event immediately after async copy)
-        copy_events[current_word_buffer_idx] = cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch)
-        copy_events[current_word_buffer_idx] = cl.enqueue_copy(queue, base_hashes_g[current_word_buffer_idx], base_hashes_np_batch)
-        copy_events[current_word_buffer_idx].wait() # Wait for first batch load
+        cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch)
+        cl.enqueue_copy(queue, base_hashes_g[current_word_buffer_idx], base_hashes_np_batch).wait()
         
     except StopIteration:
         print("Wordlist is empty or too small.")
@@ -783,141 +791,137 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
 
     # B. Main Pipelined Loop
     while True:
+        exec_idx = current_word_buffer_idx
+        next_idx = 1 - current_word_buffer_idx
         
-        # --- PHASE 1: Initialization and Execution (Current Batch) ---
-        
-        # 1. Populate the Global Hash Map with the current batch's hashes.
-        # This must be atomic and synchronous with the BFS kernel.
-        global_size_init_base = (int(math.ceil(num_words_batch_next / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-        local_size_init_base = (LOCAL_WORK_SIZE,)
-
-        # Launch the kernel to add the base hashes to the map.
-        init_event = kernel_init(queue, global_size_init_base, local_size_init_base,
-                                 global_hash_map_g,
-                                 base_hashes_g[current_word_buffer_idx],
-                                 np.uint32(num_words_batch_next),
-                                 np.uint32(GLOBAL_HASH_MAP_MASK))
-
-        # 2. Process all rule batches against the current word batch.
-        for rule_batch_idx_start in rule_batch_starts:
-            rule_batch_end = min(rule_batch_idx_start + MAX_RULES_IN_BATCH, total_rules)
-            current_rules_in_batch = rule_batch_end - rule_batch_idx_start
-
-            # a. Copy Rule Batch to GPU (synchronous copy is fine for small rule data)
-            rule_batch_data = encoded_rules[rule_batch_idx_start:rule_batch_end]
-            rules_np_batch[:current_rules_in_batch * rule_size_in_int] = np.concatenate(rule_batch_data)
-            cl.enqueue_copy(queue, rules_in_g, rules_np_batch, is_blocking=False)
+        # 7. ASYNC COPY: Start load of the *next* batch while the *current* one executes
+        next_batch_data = None
+        try:
+            next_batch_data = next(word_iterator)
+            base_words_np_next, num_words_batch_next, base_hashes_np_next = next_batch_data
             
-            # b. Reset Counters on GPU for the new rule batch
+            # Asynchronously copy the next word batch to the other GPU buffer
+            copy_events[next_idx] = cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next)
+            cl.enqueue_copy(queue, base_hashes_g[next_idx], base_hashes_np_next, wait_for=[copy_events[next_idx]])
+            
+        except StopIteration:
+            # Reached the end of the wordlist iterator
+            next_batch_data = None
+            copy_events[next_idx] = None
+        
+        # 8. PROCESS RULE BATCHES (Synchronous for the current word batch)
+        for rule_batch_idx, rule_start_index in enumerate(rule_batch_starts):
+            
+            # --- Rule Batch Setup ---
+            rule_end_index = min(rule_start_index + MAX_RULES_IN_BATCH, total_rules)
+            num_rules_in_batch = rule_end_index - rule_start_index
+
+            # Assemble a new NumPy array that is exactly the size of the current batch
+            current_rule_batch_list = encoded_rules[rule_start_index:rule_end_index]
+            current_rules_np = np.concatenate(current_rule_batch_list)
+            
+            # Copy the rule batch to the GPU buffer
+            cl.enqueue_copy(queue, rules_in_g, current_rules_np, is_blocking=True)
+            
+            # Clear the result counters on the GPU for this rule batch
             cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size)
             cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size)
-
-            # c. Set up and Launch BFS Kernel
-            global_work_size = (int(math.ceil(num_words_batch_next * current_rules_in_batch / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-            local_work_size = (LOCAL_WORK_SIZE,)
-
-            bfs_event = kernel_bfs(queue, global_work_size, local_work_size,
-                                base_words_in_g[current_word_buffer_idx],
-                                rules_in_g,
-                                rule_uniqueness_counts_g,
-                                rule_effectiveness_counts_g,
-                                global_hash_map_g,
-                                cracked_hash_map_g,
-                                np.uint32(num_words_batch_next),
-                                np.uint32(current_rules_in_batch),
-                                np.uint32(MAX_WORD_LEN),
-                                np.uint32(MAX_OUTPUT_LEN),
-                                np.uint32(GLOBAL_HASH_MAP_MASK),
-                                np.uint32(CRACKED_HASH_MAP_MASK),
-                                wait_for=[init_event] # CRITICAL: Ensure init is done before BFS reads the map
-                            )
-
-            # d. Wait for BFS and read results back to host
-            bfs_event.wait()
             
-            # Read results
+            # --- Kernel Execution Setup ---
+            global_size = (num_words_batch_exec * num_rules_in_batch, )
+            local_size = (LOCAL_WORK_SIZE, )
+            
+            # Scale global size to be a multiple of local size
+            global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+
+            # --- KERNEL EXECUTION ---
+            kernel_bfs.set_args(
+                base_words_in_g[exec_idx],
+                rules_in_g,
+                rule_uniqueness_counts_g,
+                rule_effectiveness_counts_g,
+                global_hash_map_g,
+                cracked_hash_map_g,
+                np.uint32(num_words_batch_exec),
+                np.uint32(num_rules_in_batch),
+                np.uint32(MAX_WORD_LEN),
+                np.uint32(MAX_OUTPUT_LEN),
+                np.uint32(GLOBAL_HASH_MAP_MASK),
+                np.uint32(CRACKED_HASH_MAP_MASK)
+            )
+
+            # Enqueue the main kernel (wait for the *current* word copy to finish)
+            exec_event = cl.enqueue_nd_range_kernel(queue, kernel_bfs, global_size_aligned, local_size)
+            exec_event.wait() 
+
+            # --- Read Results Back (Small, fast copy) ---
             cl.enqueue_copy(queue, mapped_uniqueness_np, rule_uniqueness_counts_g, is_blocking=True)
             cl.enqueue_copy(queue, mapped_effectiveness_np, rule_effectiveness_counts_g, is_blocking=True)
 
-            # e. Aggregate Results (Host-side)
-            total_unique_found += np.sum(mapped_uniqueness_np[:current_rules_in_batch])
-            total_cracked_found += np.sum(mapped_effectiveness_np[:current_rules_in_batch])
-            
-            # Update the global rules_list with the batch counts
-            for i in range(current_rules_in_batch):
-                rule_global_idx = rule_batch_idx_start + i
-                rules_list[rule_global_idx]['uniqueness_score'] += mapped_uniqueness_np[i]
-                rules_list[rule_global_idx]['effectiveness_score'] += mapped_effectiveness_np[i]
+            # --- Update Host Score Totals ---
+            for i in range(num_rules_in_batch):
+                rule_index = rule_start_index + i
+                
+                # Check for potential overflow before adding (Unlikely, but good practice)
+                if rules_list[rule_index]['uniqueness_score'] + mapped_uniqueness_np[i] < rules_list[rule_index]['uniqueness_score']:
+                    print(f"⚠️ Uniqueness score overflow detected for rule ID {rules_list[rule_index]['rule_id']}")
+                
+                rules_list[rule_index]['uniqueness_score'] += mapped_uniqueness_np[i]
+                rules_list[rule_index]['effectiveness_score'] += mapped_effectiveness_np[i]
+                
+                total_unique_found += mapped_uniqueness_np[i]
+                total_cracked_found += mapped_effectiveness_np[i]
 
-        # 3. Update progress bar
-        words_processed_total += num_words_batch_next
+
+        # 9. UPDATE AND PREPARE NEXT ITERATION
+        
+        words_processed_total += num_words_batch_exec
+        word_batch_pbar.update(num_words_batch_exec)
         word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,}]")
-        word_batch_pbar.update(num_words_batch_next)
 
-        # --- PHASE 2: Load NEXT batch (Pipelining) ---
-        try:
-            # Swap buffers for the next iteration
-            next_word_buffer_idx = 1 - current_word_buffer_idx
+        if next_batch_data is None:
+            # Last batch was processed, exit the loop
+            break
             
-            # Get the next batch from the generator
-            base_words_np_batch, num_words_batch_next, base_hashes_np_batch = next(word_iterator)
+        # Switch buffers and prepare for the next iteration
+        current_word_buffer_idx = next_idx
+        num_words_batch_exec = num_words_batch_next
 
-            # Async copy the *next* batch's data to the *other* buffer
-            copy_events[next_word_buffer_idx] = cl.enqueue_copy(queue, base_words_in_g[next_word_buffer_idx], base_words_np_batch)
-            copy_events[next_word_buffer_idx] = cl.enqueue_copy(queue, base_hashes_g[next_word_buffer_idx], base_hashes_np_batch)
-            
-            # Prepare for the next loop iteration (the buffer we just copied to becomes the current one)
-            current_word_buffer_idx = next_word_buffer_idx
-            
-        except StopIteration:
-            # Wordlist finished. The current batch was the last one processed in Phase 1.
-            word_batch_pbar.close()
-            break # Exit loop
-    
-    # 7. Final Output
+
+    word_batch_pbar.close()
     end_time = time()
-    print(f"\nTotal processing time: {end_time - start_time:.2f} seconds.")
-    print(f"Total words processed: {words_processed_total:,}")
-    print(f"Total unique words generated and checked: {total_unique_found:,}")
-    print(f"Total cracked words found: {total_cracked_found:,}")
-
-    # Save the full ranking data to CSV
-    csv_path = save_ranking_data(rules_list, ranking_output_path.replace(".rule", "_ranking.csv"))
     
-    # Generate the final optimized rule file
-    if csv_path:
-        load_and_save_optimized_rules(csv_path, ranking_output_path, top_k)
+    # 10. FINAL REPORTING AND SAVING
+    
+    print("\n--- Final Results Summary ---")
+    print(f"Total Words Processed: {words_processed_total:,}")
+    print(f"Total Unique Words Generated: {total_unique_found:,}")
+    print(f"Total True Cracks Found: {total_cracked_found:,}")
+    print(f"Total Execution Time: {end_time - start_time:.2f} seconds")
+    print("-----------------------------\n")
 
+    # Save ranking data and optimize rules
+    csv_path = save_ranking_data(rules_list, ranking_output_path)
+    if top_k > 0:
+        optimized_output_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
+        load_and_save_optimized_rules(csv_path, optimized_output_path, top_k)
 
-# --- MAIN EXECUTION BLOCK (Unchanged) ---
-def main():
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool.")
-    parser.add_argument('wordlist', help="Path to the base wordlist file.")
-    parser.add_argument('rules', help="Path to the hashcat rules file.")
-    parser.add_argument('cracked', help="Path to the cracked passwords list for effectiveness scoring.")
-    parser.add_argument('output', help="Path for the output optimized rule file (e.g., optimized.rule).")
-    parser.add_argument('--top-k', type=int, default=1000, help="Number of top rules to save in the optimized rule file.")
-
-    args = parser.parse_args()
-
-    # Sanity checks
-    if not os.path.exists(args.wordlist):
-        print(f"Error: Wordlist not found at {args.wordlist}")
-        return
-    if not os.path.exists(args.rules):
-        print(f"Error: Rules file not found at {args.rules}")
-        return
-
-    rank_rules_uniqueness(args.wordlist, args.rules, args.cracked, args.output, args.top_k)
+# --- END OF MAIN RANKING FUNCTION ---
 
 if __name__ == '__main__':
-    # Added basic argument parsing for demonstration compatibility
-    # If run in an environment without command-line arguments, this will fail
-    # In a typical script execution, this block is where you would call main()
-    if len(os.sys.argv) > 1:
-        main()
-    else:
-        print("Usage: python ranker_v2_8_optimized.py <wordlist> <rules> <cracked> <output> [--top-k N]")
+    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v2.8)")
+    parser.add_argument('-w', '--wordlist', required=True, help='Path to the base wordlist file.')
+    parser.add_argument('-r', '--rules', required=True, help='Path to the Hashcat rules file to rank.')
+    parser.add_argument('-c', '--cracked', required=True, help='Path to a list of cracked passwords for effectiveness scoring.')
+    parser.add_argument('-o', '--output', default='ranker_output.csv', help='Path to save the final ranking CSV.')
+    parser.add_argument('-k', '--topk', type=int, default=1000, help='Number of top rules to save to an optimized .rule file. Set to 0 to skip.')
+    
+    args = parser.parse_args()
 
-# --- END OF MAIN EXECUTION BLOCK ---
-
+    rank_rules_uniqueness(
+        wordlist_path=args.wordlist,
+        rules_path=args.rules,
+        cracked_list_path=args.cracked,
+        ranking_output_path=args.output,
+        top_k=args.topk
+    )
