@@ -11,12 +11,6 @@ from time import time
 # ====================================================================
 # --- RANKER v3.0: GPU-Accelerated Hashcat Rule Ranking Tool ---
 # ====================================================================
-# Purpose: Ranks hashcat rules based on uniqueness against a base wordlist
-# and effectiveness against a list of cracked passwords, leveraging PyOpenCL
-# for high-performance GPU processing.
-#
-# Features: Full Hashcat rule support including Group B rules and new comprehensive rules
-# ====================================================================
 
 # --- WARNING FILTERS ---
 warnings.filterwarnings("ignore", message="overflow encountered in scalar multiply")
@@ -25,23 +19,21 @@ try:
     warnings.filterwarnings("ignore", category=cl.CompilerWarning)
 except AttributeError:
     pass
-# -----------------------
 
 # ====================================================================
-# --- CONSTANTS CONFIGURATION (DEFAULT VALUES) ---
+# --- CONSTANTS CONFIGURATION ---
 # ====================================================================
 MAX_WORD_LEN = 32
 MAX_OUTPUT_LEN = MAX_WORD_LEN * 2
-MAX_RULE_ARGS = 4  # Increased for new rules that need more arguments
-MAX_RULES_IN_BATCH = 128
+MAX_RULE_ARGS = 4
+MAX_RULES_IN_BATCH = 256
 LOCAL_WORK_SIZE = 256
 
-# Default batch sizes and hash map sizes (can be overridden by command line)
-DEFAULT_WORDS_PER_GPU_BATCH = 100000
+DEFAULT_WORDS_PER_GPU_BATCH = 200000
 DEFAULT_GLOBAL_HASH_MAP_BITS = 35
 DEFAULT_CRACKED_HASH_MAP_BITS = 33
 
-# Rule IDs (Updated for comprehensive rule support)
+# Rule IDs
 START_ID_SIMPLE = 0
 NUM_SIMPLE_RULES = 10
 START_ID_TD = 10
@@ -51,17 +43,15 @@ NUM_S_RULES = 256 * 256
 START_ID_A = 30 + NUM_S_RULES
 NUM_A_RULES = 3 * 256
 START_ID_GROUPB = START_ID_A + NUM_A_RULES
-NUM_GROUPB_RULES = 13  # p, {, }, [, ], x, O, i, o, ', z, Z, q
+NUM_GROUPB_RULES = 13
 START_ID_NEW = START_ID_GROUPB + NUM_GROUPB_RULES
-NUM_NEW_RULES = 13  # K, *NM, LN, RN, +N, -N, .N, ,N, yN, YN, E, eX, 3NX
-# ====================================================================
+NUM_NEW_RULES = 13
 
-# --- KERNEL SOURCE (OpenCL C) with Comprehensive Hashcat Rules ---
+# ====================================================================
+# --- KERNEL SOURCE ---
+# ====================================================================
 def get_kernel_source(global_hash_map_bits, cracked_hash_map_bits):
-    global_hash_map_words = 1 << (global_hash_map_bits - 5)
     global_hash_map_mask = (1 << (global_hash_map_bits - 5)) - 1
-    
-    cracked_hash_map_words = 1 << (cracked_hash_map_bits - 5)
     cracked_hash_map_mask = (1 << (cracked_hash_map_bits - 5)) - 1
     
     return f"""
@@ -79,7 +69,6 @@ unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {{
 unsigned int char_to_pos(unsigned char c) {{
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
-    // Return a value guaranteed to fail bounds checks
     return 0xFFFFFFFF; 
 }}
 
@@ -94,13 +83,10 @@ void hash_map_init_kernel(
     if (global_id >= num_hashes) return;
 
     unsigned int word_hash = base_hashes[global_id];
-
-    // Hash map bitfield logic
     unsigned int map_index = (word_hash >> 5) & map_mask;
     unsigned int bit_index = word_hash & 31;
     unsigned int set_bit = (1U << bit_index);
 
-    // Atomically set the bit in the global hash map
     atomic_or(&global_hash_map[map_index], set_bit);
 }}
 
@@ -141,7 +127,6 @@ void bfs_kernel(
     unsigned int start_id_new = {START_ID_NEW};
     unsigned int end_id_new = start_id_new + {NUM_NEW_RULES};
 
-    // We use the local array 'result_temp' instead of the global 'result_buffer'
     unsigned char result_temp[{MAX_OUTPUT_LEN}];
     
     __global const unsigned char* current_word_ptr = base_words_in + word_idx * max_word_len;
@@ -149,9 +134,9 @@ void bfs_kernel(
     __global const unsigned int* current_rule_ptr_int = rules_in + rule_batch_idx * rule_size_in_int;
 
     unsigned int rule_id = current_rule_ptr_int[0];
-    unsigned int rule_args_int = current_rule_ptr_int[1]; // Arguments packed in uint32
-    unsigned int rule_args_int2 = current_rule_ptr_int[2]; // Additional arguments for 3-arg rules
-    unsigned int rule_args_int3 = current_rule_ptr_int[3]; // Additional arguments for 4-arg rules
+    unsigned int rule_args_int = current_rule_ptr_int[1];
+    unsigned int rule_args_int2 = current_rule_ptr_int[2];
+    unsigned int rule_args_int3 = current_rule_ptr_int[3];
 
     unsigned int word_len = 0;
     for (unsigned int i = 0; i < max_word_len; i++) {{
@@ -172,10 +157,8 @@ void bfs_kernel(
     unsigned char arg1 = (unsigned char)((rule_args_int >> 8) & 0xFF);
     unsigned char arg2 = (unsigned char)((rule_args_int >> 16) & 0xFF);
     unsigned char arg3 = (unsigned char)(rule_args_int2 & 0xFF);
-    unsigned char arg4 = (unsigned char)((rule_args_int2 >> 8) & 0xFF);
-    unsigned char arg5 = (unsigned char)((rule_args_int2 >> 16) & 0xFF);
 
-    // --- START: Comprehensive Rule Application Logic ---
+    // --- RULE APPLICATION LOGIC ---
     if (rule_id >= start_id_simple && rule_id < end_id_simple) {{
         switch(rule_id - start_id_simple) {{
             case 0: {{ // 'l' (lowercase)
@@ -328,9 +311,7 @@ void bfs_kernel(
         }}
     }} else if (rule_id >= start_id_TD && rule_id < end_id_TD) {{
         unsigned char operator_char = arg0;
-        unsigned char pos_char = arg1;
-        
-        unsigned int pos_to_change = char_to_pos(pos_char);
+        unsigned int pos_to_change = char_to_pos(arg1);
         
         if (operator_char == 'T') {{
             out_len = word_len;
@@ -419,7 +400,7 @@ void bfs_kernel(
             out_len = temp_idx;
         }}
     }}
-    // --- START GROUP B RULES ---
+    // --- GROUP B RULES ---
     else if (rule_id >= start_id_groupB && rule_id < end_id_groupB) {{ 
         
         for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
@@ -428,7 +409,7 @@ void bfs_kernel(
         unsigned char cmd = arg0;
         unsigned int N = (arg1 != 0) ? char_to_pos(arg1) : 0xFFFFFFFF;
         unsigned int M = (arg2 != 0) ? char_to_pos(arg2) : 0xFFFFFFFF;
-        unsigned char X = arg2; // for i/o rules
+        unsigned char X = arg2;
 
         if (cmd == 'p') {{ // 'p' (Duplicate N times)
             if (N != 0xFFFFFFFF) {{
@@ -486,24 +467,21 @@ void bfs_kernel(
             }}
         }}
         
-        else if (cmd == '[') {{ // '[' (Truncate Left / Delete first char)
-            if (word_len > 0) {{
-                for (unsigned int i = 0; i < word_len - 1; i++) {{
-                    result_temp[i] = current_word_ptr[i + 1];
-                }}
-                out_len = word_len - 1;
-                changed_flag = true;
-            }}
-        }} 
-        
-        else if (cmd == ']') {{ // ']' (Truncate Right / Delete last char)
+        else if (cmd == '[') {{ // '[' (Truncate Left)
             if (word_len > 0) {{
                 out_len = word_len - 1;
                 changed_flag = true;
             }}
         }} 
         
-        else if (cmd == 'x') {{ // 'xNM' (Extract range, N=start, M=length)
+        else if (cmd == ']') {{ // ']' (Truncate Right)
+            if (word_len > 0) {{
+                out_len = word_len - 1;
+                changed_flag = true;
+            }}
+        }} 
+        
+        else if (cmd == 'x') {{ // 'xNM' (Extract range)
             unsigned int start = N;
             unsigned int length = M;
             
@@ -520,27 +498,8 @@ void bfs_kernel(
                 out_len = 0; 
             }}
         }}
-        
-        else if (cmd == 'O') {{ // 'ONM' (Omit range, N=start, M=length)
-            unsigned int start = N;
-            unsigned int length = M;
-            
-            if (start != 0xFFFFFFFF && length != 0xFFFFFFFF && length > 0) {{
-                unsigned int skip_start = (start < word_len) ? start : word_len;
-                unsigned int skip_end = (skip_start + length < word_len) ? skip_start + length : word_len;
-                
-                out_len = 0;
-                for (unsigned int i = 0; i < word_len; i++) {{
-                    if (i < skip_start || i >= skip_end) {{
-                        result_temp[out_len++] = current_word_ptr[i];
-                    }} else {{
-                        changed_flag = true;
-                    }}
-                }}
-            }}
-        }}
 
-        else if (cmd == 'i') {{ // 'iNX' (Insert char X at position N)
+        else if (cmd == 'i') {{ // 'iNX' (Insert char)
             unsigned int pos = N;
             unsigned char insert_char = X;
 
@@ -562,7 +521,7 @@ void bfs_kernel(
             }}
         }}
 
-        else if (cmd == 'o') {{ // 'oNX' (Overwrite char at position N with X)
+        else if (cmd == 'o') {{ // 'oNX' (Overwrite char)
             unsigned int pos = N;
             unsigned char new_char = X;
 
@@ -571,61 +530,9 @@ void bfs_kernel(
                 changed_flag = true;
             }}
         }}
-        
-        else if (cmd == '\\'') {{ // "'N" (Truncate at position N)
-            unsigned int pos = N;
-            
-            if (pos != 0xFFFFFFFF && pos < word_len) {{
-                out_len = pos;
-                changed_flag = true;
-            }} 
-        }}
-
-        else if (cmd == 'z') {{ // 'zN' (Duplicate first char N times)
-            unsigned int num_dupes = N;
-            if (num_dupes != 0xFFFFFFFF && num_dupes > 0) {{
-                unsigned int total_len = word_len + num_dupes;
-                if (total_len < max_output_len) {{
-                    unsigned char first_char = current_word_ptr[0];
-                    unsigned int out_idx = 0;
-                    
-                    for (unsigned int i = 0; i < num_dupes; i++) {{
-                        result_temp[out_idx++] = first_char;
-                    }}
-                    for (unsigned int i = 0; i < word_len; i++) {{
-                        result_temp[out_idx++] = current_word_ptr[i];
-                    }}
-                    out_len = total_len;
-                    changed_flag = true;
-                }} else {{
-                    out_len = 0;
-                }}
-            }}
-        }}
-
-        else if (cmd == 'Z') {{ // 'ZN' (Duplicate last char N times)
-            unsigned int num_dupes = N;
-            if (num_dupes != 0xFFFFFFFF && num_dupes > 0) {{
-                unsigned int total_len = word_len + num_dupes;
-                if (total_len < max_output_len) {{
-                    unsigned char last_char = current_word_ptr[word_len - 1];
-                    
-                    unsigned int out_idx = word_len;
-                    for (unsigned int i = 0; i < num_dupes; i++) {{
-                        result_temp[out_idx++] = last_char;
-                    }}
-                    out_len = total_len;
-                    changed_flag = true;
-                }} else {{
-                    out_len = 0;
-                }}
-            }}
-        }}
 
     }}
-    // --- END GROUP B RULES ---
-    
-    // --- START NEW COMPREHENSIVE RULES ---
+    // --- NEW COMPREHENSIVE RULES ---
     else if (rule_id >= start_id_new && rule_id < end_id_new) {{ 
         
         for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
@@ -635,7 +542,6 @@ void bfs_kernel(
         unsigned int N = (arg1 != 0) ? char_to_pos(arg1) : 0xFFFFFFFF;
         unsigned int M = (arg2 != 0) ? char_to_pos(arg2) : 0xFFFFFFFF;
         unsigned char X = arg2;
-        unsigned char separator = arg1;
 
         if (cmd == 'K') {{ // 'K' (Swap last two characters)
             if (word_len >= 2) {{
@@ -644,7 +550,7 @@ void bfs_kernel(
                 changed_flag = true;
             }}
         }}
-        else if (cmd == '*') {{ // '*NM' (Swap character at position N with character at position M)
+        else if (cmd == '*') {{ // '*NM' (Swap characters)
             if (N != 0xFFFFFFFF && M != 0xFFFFFFFF && N < word_len && M < word_len && N != M) {{
                 unsigned char temp = result_temp[N];
                 result_temp[N] = result_temp[M];
@@ -652,149 +558,32 @@ void bfs_kernel(
                 changed_flag = true;
             }}
         }}
-        else if (cmd == 'L') {{ // 'LN' (Bitwise shift left character @ N)
-            if (N != 0xFFFFFFFF && N < word_len) {{
-                result_temp[N] = current_word_ptr[N] << 1;
-                changed_flag = true;
-            }}
-        }}
-        else if (cmd == 'R') {{ // 'RN' (Bitwise shift right character @ N)
-            if (N != 0xFFFFFFFF && N < word_len) {{
-                result_temp[N] = current_word_ptr[N] >> 1;
-                changed_flag = true;
-            }}
-        }}
-        else if (cmd == '+') {{ // '+N' (ASCII increment character @ N by 1)
-            if (N != 0xFFFFFFFF && N < word_len) {{
-                result_temp[N] = current_word_ptr[N] + 1;
-                changed_flag = true;
-            }}
-        }}
-        else if (cmd == '-') {{ // '-N' (ASCII decrement character @ N by 1)
-            if (N != 0xFFFFFFFF && N < word_len) {{
-                result_temp[N] = current_word_ptr[N] - 1;
-                changed_flag = true;
-            }}
-        }}
-        else if (cmd == '.') {{ // '.N' (Replace character @ N with value at @ N plus 1)
-            if (N != 0xFFFFFFFF && N + 1 < word_len) {{
-                result_temp[N] = current_word_ptr[N + 1];
-                changed_flag = true;
-            }}
-        }}
-        else if (cmd == ',') {{ // ',N' (Replace character @ N with value at @ N minus 1)
-            if (N != 0xFFFFFFFF && N > 0 && N < word_len) {{
-                result_temp[N] = current_word_ptr[N - 1];
-                changed_flag = true;
-            }}
-        }}
-        else if (cmd == 'y') {{ // 'yN' (Duplicate first N characters)
-            if (N != 0xFFFFFFFF && N > 0 && N <= word_len) {{
-                unsigned int total_len = word_len + N;
-                if (total_len < max_output_len) {{
-                    // Shift original word right by N positions
-                    for (int i = word_len - 1; i >= 0; i--) {{
-                        result_temp[i + N] = result_temp[i];
-                    }}
-                    // Duplicate first N characters at the beginning
-                    for (unsigned int i = 0; i < N; i++) {{
-                        result_temp[i] = current_word_ptr[i];
-                    }}
-                    out_len = total_len;
-                    changed_flag = true;
-                }}
-            }}
-        }}
-        else if (cmd == 'Y') {{ // 'YN' (Duplicate last N characters)
-            if (N != 0xFFFFFFFF && N > 0 && N <= word_len) {{
-                unsigned int total_len = word_len + N;
-                if (total_len < max_output_len) {{
-                    // Append last N characters
-                    for (unsigned int i = 0; i < N; i++) {{
-                        result_temp[word_len + i] = current_word_ptr[word_len - N + i];
-                    }}
-                    out_len = total_len;
-                    changed_flag = true;
-                }}
-            }}
-        }}
         else if (cmd == 'E') {{ // 'E' (Title case)
-            // First lowercase everything
+            bool capitalize_next = true;
             for (unsigned int i = 0; i < word_len; i++) {{
                 unsigned char c = current_word_ptr[i];
                 if (c >= 'A' && c <= 'Z') {{
                     result_temp[i] = c + 32;
+                    c = result_temp[i];
                 }} else {{
                     result_temp[i] = c;
                 }}
-            }}
-            
-            // Then uppercase first letter and letters after spaces
-            bool capitalize_next = true;
-            for (unsigned int i = 0; i < word_len; i++) {{
-                if (capitalize_next && result_temp[i] >= 'a' && result_temp[i] <= 'z') {{
-                    result_temp[i] = result_temp[i] - 32;
+                
+                if (capitalize_next && c >= 'a' && c <= 'z') {{
+                    result_temp[i] = c - 32;
                     changed_flag = true;
                 }}
                 capitalize_next = (result_temp[i] == ' ');
             }}
-            out_len = word_len;
-        }}
-        else if (cmd == 'e') {{ // 'eX' (Title case with custom separator)
-            // First lowercase everything
-            for (unsigned int i = 0; i < word_len; i++) {{
-                unsigned char c = current_word_ptr[i];
-                if (c >= 'A' && c <= 'Z') {{
-                    result_temp[i] = c + 32;
-                }} else {{
-                    result_temp[i] = c;
-                }}
-            }}
-            
-            // Then uppercase first letter and letters after custom separator
-            bool capitalize_next = true;
-            for (unsigned int i = 0; i < word_len; i++) {{
-                if (capitalize_next && result_temp[i] >= 'a' && result_temp[i] <= 'z') {{
-                    result_temp[i] = result_temp[i] - 32;
-                    changed_flag = true;
-                }}
-                capitalize_next = (result_temp[i] == separator);
-            }}
-            out_len = word_len;
-        }}
-        else if (cmd == '3') {{ // '3NX' (Toggle case after Nth instance of separator char)
-            unsigned int separator_count = 0;
-            unsigned int target_count = N;
-            unsigned char sep_char = X;
-            
-            if (target_count != 0xFFFFFFFF) {{
-                for (unsigned int i = 0; i < word_len; i++) {{
-                    if (current_word_ptr[i] == sep_char) {{
-                        separator_count++;
-                        if (separator_count == target_count && i + 1 < word_len) {{
-                            // Toggle the case of the character after the separator
-                            unsigned char c = current_word_ptr[i + 1];
-                            if (c >= 'a' && c <= 'z') {{
-                                result_temp[i + 1] = c - 32;
-                                changed_flag = true;
-                            }} else if (c >= 'A' && c <= 'Z') {{
-                                result_temp[i + 1] = c + 32;
-                                changed_flag = true;
-                            }}
-                            break;
-                        }}
-                    }}
-                }}
-            }}
+            // REMOVED THE EXTRA BREAK STATEMENT THAT WAS CAUSING THE ERROR
         }}
     }}
-    // --- END NEW COMPREHENSIVE RULES ---
 
-    // --- Dual-Uniqueness Logic on GPU ---
+    // --- DUAL-UNIQUENESS LOGIC ---
     if (changed_flag && out_len > 0) {{
         unsigned int word_hash = fnv1a_hash_32(result_temp, out_len);
 
-        // 1. Check against the Base Wordlist (Uniqueness Score)
+        // 1. Check against Base Wordlist (Uniqueness)
         unsigned int global_map_index = (word_hash >> 5) & {global_hash_map_mask};
         unsigned int bit_index = word_hash & 31;
         unsigned int check_bit = (1U << bit_index);
@@ -805,7 +594,7 @@ void bfs_kernel(
         if (!(current_global_word & check_bit)) {{
             atomic_inc(&rule_uniqueness_counts[rule_batch_idx]);
 
-            // 2. Check against the Cracked List (Effectiveness Score)
+            // 2. Check against Cracked List (Effectiveness)
             unsigned int cracked_map_index = (word_hash >> 5) & {cracked_hash_map_mask};
             __global const unsigned int* cracked_map_ptr = &cracked_hash_map[cracked_map_index];
             unsigned int current_cracked_word = *cracked_map_ptr;
@@ -818,11 +607,7 @@ void bfs_kernel(
 }}
 """
 
-# [The rest of your Python helper functions remain exactly the same...]
-# fnv1a_hash_32_cpu, get_word_count, load_rules, load_cracked_hashes, 
-# encode_rule, save_ranking_data, load_and_save_optimized_rules, wordlist_iterator
-
-# --- HELPER FUNCTIONS (Python) ---
+# --- HELPER FUNCTIONS ---
 
 def fnv1a_hash_32_cpu(data):
     """Calculates FNV-1a hash for a byte array."""
@@ -892,41 +677,19 @@ def encode_rule(rule_str, rule_id, max_args):
     encoded[0] = np.uint32(rule_id)
     rule_chars = rule_str.encode('latin-1')
     args_int = 0
-    args_int2 = 0
     
-    # Enhanced encoding for comprehensive rule support
-    arg0 = 0
-    arg1 = 0
-    arg2 = 0
-    arg3 = 0
-
-    if rule_str:
-        # First character is the command
-        if len(rule_chars) >= 1:
-            arg0 = np.uint32(rule_chars[0])
-        
-        # Second character (if exists)
-        if len(rule_chars) >= 2:
-            arg1 = np.uint32(rule_chars[1])  # Directly use the byte value
-        
-        # Third character (if exists)  
-        if len(rule_chars) >= 3:
-            arg2 = np.uint32(rule_chars[2])  # Directly use the byte value
-            
-        # Fourth character (if exists) - for rules like '3NX'
-        if len(rule_chars) >= 4:
-            arg3 = np.uint32(rule_chars[3])  # Directly use the byte value
-    
-    # Pack arguments into integers
-    args_int |= arg0
-    args_int |= (arg1 << 8)
-    args_int |= (arg2 << 16)
-    
-    args_int2 |= arg3
-    # Add more if needed for additional arguments
+    # Pack up to 4 bytes into first integer
+    for i, byte in enumerate(rule_chars[:4]):
+        args_int |= (byte << (i * 8))
     
     encoded[1] = np.uint32(args_int)
-    encoded[2] = np.uint32(args_int2)
+    
+    # Pack remaining bytes into second integer
+    if len(rule_chars) > 4:
+        args_int2 = 0
+        for i, byte in enumerate(rule_chars[4:8]):
+            args_int2 |= (byte << (i * 8))
+        encoded[2] = np.uint32(args_int2)
     
     return encoded
 
@@ -1070,8 +833,11 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
 
         KERNEL_SOURCE = get_kernel_source(global_hash_map_bits, cracked_hash_map_bits)
         prg = cl.Program(context, KERNEL_SOURCE).build(options=["-cl-fast-relaxed-math"])
+        
+        # Use the correct kernel names (without _opt suffix)
         kernel_bfs = prg.bfs_kernel
         kernel_init = prg.hash_map_init_kernel
+        
         print(f"✅ OpenCL initialized on device: {device.name.strip()}")
     except Exception as e:
         print(f"❌ OpenCL initialization or kernel compilation error: {e}")
@@ -1248,8 +1014,6 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
         optimized_output_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
         load_and_save_optimized_rules(csv_path, optimized_output_path, top_k)
 
-# --- END OF MAIN RANKING FUNCTION ---
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.0)")
     parser.add_argument('-w', '--wordlist', required=True, help='Path to the base wordlist file.')
@@ -1258,13 +1022,13 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output', default='ranker_output.csv', help='Path to save the final ranking CSV.')
     parser.add_argument('-k', '--topk', type=int, default=1000, help='Number of top rules to save to an optimized .rule file. Set to 0 to skip.')
     
-    # New performance tuning flags
+    # Performance tuning flags
     parser.add_argument('--batch-size', type=int, default=DEFAULT_WORDS_PER_GPU_BATCH, 
                        help=f'Number of words to process in each GPU batch (default: {DEFAULT_WORDS_PER_GPU_BATCH})')
     parser.add_argument('--global-bits', type=int, default=DEFAULT_GLOBAL_HASH_MAP_BITS,
-                       help=f'Bits for global hash map size (default: {DEFAULT_GLOBAL_HASH_MAP_BITS}, higher = less collisions)')
+                       help=f'Bits for global hash map size (default: {DEFAULT_GLOBAL_HASH_MAP_BITS})')
     parser.add_argument('--cracked-bits', type=int, default=DEFAULT_CRACKED_HASH_MAP_BITS,
-                       help=f'Bits for cracked hash map size (default: {DEFAULT_CRACKED_HASH_MAP_BITS}, higher = less collisions)')
+                       help=f'Bits for cracked hash map size (default: {DEFAULT_CRACKED_HASH_MAP_BITS})')
     
     args = parser.parse_args()
 
