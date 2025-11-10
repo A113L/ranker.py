@@ -10,7 +10,7 @@ from time import time
 import mmap
 
 # ====================================================================
-# --- RANKER v3.0: GPU-Accelerated Hashcat Rule Ranking Tool ---
+# --- RANKER v3.1: IMPROVED CAPACITY FOR LARGE RULE SETS ---
 # ====================================================================
 
 # --- WARNING FILTERS ---
@@ -24,12 +24,12 @@ except AttributeError:
     pass
 
 # ====================================================================
-# --- CONSTANTS CONFIGURATION ---
+# --- INCREASED CONSTANTS FOR LARGE RULE SETS ---
 # ====================================================================
 MAX_WORD_LEN = 32
 MAX_OUTPUT_LEN = MAX_WORD_LEN * 2
 MAX_RULE_ARGS = 4
-MAX_RULES_IN_BATCH = 256
+MAX_RULES_IN_BATCH = 1024  # INCREASED FROM 256 TO 1024 (4x capacity)
 LOCAL_WORK_SIZE = 256
 
 # Default values (will be adjusted based on VRAM)
@@ -46,7 +46,7 @@ MIN_HASH_MAP_BITS = 28     # Minimum hash map size (256MB)
 MEMORY_REDUCTION_FACTOR = 0.7  # Reduce memory by 30% on each retry
 MAX_ALLOCATION_RETRIES = 5     # Maximum retries for memory allocation
 
-# Rule IDs
+# Rule IDs (updated for larger capacity)
 START_ID_SIMPLE = 0
 NUM_SIMPLE_RULES = 10
 START_ID_TD = 10
@@ -59,6 +59,230 @@ START_ID_GROUPB = START_ID_A + NUM_A_RULES
 NUM_GROUPB_RULES = 13
 START_ID_NEW = START_ID_GROUPB + NUM_GROUPB_RULES
 NUM_NEW_RULES = 13
+
+# ====================================================================
+# --- MISSING HELPER FUNCTIONS ---
+# ====================================================================
+
+def get_word_count(path):
+    """Counts total words in file to set up progress bar."""
+    print(f"Counting words in: {path}...")
+    count = 0
+    try:
+        with open(path, 'r', encoding='latin-1', errors='ignore') as f:
+            for line in f:
+                count += 1
+    except FileNotFoundError:
+        print(f"Error: Wordlist file not found at: {path}")
+        exit(1)
+
+    print(f"Total words found: {count:,}")
+    return count
+
+def load_rules(path):
+    """Loads Hashcat rules from file."""
+    print(f"Loading rules from: {path}...")
+    rules_list = []
+    rule_id_counter = 0
+    try:
+        with open(path, 'r', encoding='latin-1') as f:
+            for line in f:
+                rule = line.strip()
+                if not rule or rule.startswith('#'):
+                    continue
+                rules_list.append({'rule_data': rule, 'rule_id': rule_id_counter, 'uniqueness_score': 0, 'effectiveness_score': 0})
+                rule_id_counter += 1
+    except FileNotFoundError:
+        print(f"Error: Rules file not found at: {path}")
+        exit(1)
+
+    print(f"Loaded {len(rules_list)} rules.")
+    return rules_list
+
+def fnv1a_hash_32_cpu(data):
+    """Calculates FNV-1a hash for a byte array."""
+    hash_val = np.uint32(2166136261)
+    for byte in data:
+        hash_val ^= np.uint32(byte)
+        hash_val *= np.uint32(16777619)
+    return hash_val
+
+def load_cracked_hashes(path, max_len):
+    """Loads a list of cracked passwords and returns their FNV-1a hashes."""
+    print(f"Loading cracked list for effectiveness check from: {path}...")
+    cracked_hashes = []
+    try:
+        with open(path, 'r', encoding='latin-1', errors='ignore') as f:
+            for line in f:
+                word = line.strip().encode('latin-1')
+                if 1 <= len(word) <= max_len:
+                    cracked_hashes.append(fnv1a_hash_32_cpu(word))
+    except FileNotFoundError:
+        print(f"Warning: Cracked list file not found at: {path}. Effectiveness scores will be zero.")
+        return np.array([], dtype=np.uint32)
+
+    unique_hashes = np.unique(np.array(cracked_hashes, dtype=np.uint32))
+    print(f"Loaded {len(unique_hashes):,} unique cracked password hashes.")
+    return unique_hashes
+
+def encode_rule(rule_str, rule_id, max_args):
+    """Encodes a rule as an array of uint32: [rule ID, arguments]"""
+    rule_size_in_int = 2 + max_args
+    encoded = np.zeros(rule_size_in_int, dtype=np.uint32)
+    encoded[0] = np.uint32(rule_id)
+    rule_chars = rule_str.encode('latin-1')
+    args_int = 0
+    
+    # Pack up to 4 bytes into first integer
+    for i, byte in enumerate(rule_chars[:4]):
+        args_int |= (byte << (i * 8))
+    
+    encoded[1] = np.uint32(args_int)
+    
+    # Pack remaining bytes into second integer
+    if len(rule_chars) > 4:
+        args_int2 = 0
+        for i, byte in enumerate(rule_chars[4:8]):
+            args_int2 |= (byte << (i * 8))
+        encoded[2] = np.uint32(args_int2)
+    
+    return encoded
+
+def save_ranking_data(ranking_list, output_path):
+    """Saves the scoring and ranking data to a separate CSV file."""
+    ranking_output_path = output_path
+    
+    print(f"Saving rule ranking data to: {ranking_output_path}...")
+
+    # Calculate a combined score for ranking
+    for rule in ranking_list:
+        rule['combined_score'] = rule.get('effectiveness_score', 0) * 10 + rule.get('uniqueness_score', 0)
+
+    # FIXED: Save ALL rules regardless of score
+    ranked_rules = ranking_list  # Save ALL rules instead of filtering
+    
+    ranked_rules.sort(key=lambda rule: rule['combined_score'], reverse=True)
+
+    print(f"💾 Saving ALL {len(ranked_rules):,} rules (including zero-score rules)")
+
+    if not ranked_rules:
+        print("❌ No rules to save. Ranking file not created.")
+        return None
+
+    try:
+        with open(ranking_output_path, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 'Rule_Data']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for rank, rule in enumerate(ranked_rules, 1):
+                writer.writerow({
+                    'Rank': rank,
+                    'Combined_Score': rule['combined_score'],
+                    'Effectiveness_Score': rule.get('effectiveness_score', 0),
+                    'Uniqueness_Score': rule.get('uniqueness_score', 0),
+                    'Rule_Data': rule['rule_data']
+                })
+
+        print(f"✅ Ranking data saved successfully to {ranking_output_path}.")
+        return ranking_output_path
+    except Exception as e:
+        print(f"❌ Error while saving ranking data to CSV file: {e}")
+        return None
+
+def load_and_save_optimized_rules(csv_path, output_path, top_k):
+    """Loads ranking data from a CSV, sorts, and saves the Top K rules."""
+    if not csv_path:
+        print("\nOptimization skipped: Ranking CSV path is missing.")
+        return
+
+    print(f"\nLoading ranking from CSV: {csv_path} and saving Top {top_k} Optimized Rules to: {output_path}...")
+    
+    ranked_data = []
+    try:
+        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    row['Combined_Score'] = int(row['Combined_Score'])
+                    ranked_data.append(row)
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        print(f"❌ Error: Ranking CSV file not found at: {csv_path}")
+        return
+    except Exception as e:
+        print(f"❌ Error while reading CSV: {e}")
+        return
+
+    # FIXED: Include ALL rules from CSV, don't filter by score
+    print(f"📊 Loaded {len(ranked_data):,} total rules from CSV")
+
+    ranked_data.sort(key=lambda row: row['Combined_Score'], reverse=True)
+    
+    # FIXED: Cap at available rules if top_k exceeds available count
+    available_rules = len(ranked_data)
+    if top_k > available_rules:
+        print(f"⚠️  Warning: Requested {top_k:,} rules but only {available_rules:,} available. Saving {available_rules:,} rules.")
+        final_optimized_list = ranked_data[:available_rules]
+    else:
+        final_optimized_list = ranked_data[:top_k]
+
+    if not final_optimized_list:
+        print("❌ No rules available after sorting/filtering. Optimized rule file not created.")
+        return
+
+    try:
+        with open(output_path, 'w', newline='\n', encoding='utf-8') as f:
+            f.write(":\n")  # Default rule
+            for rule in final_optimized_list:
+                f.write(f"{rule['Rule_Data']}\n")
+        print(f"✅ Top {len(final_optimized_list):,} optimized rules saved successfully to {output_path}.")
+    except Exception as e:
+        print(f"❌ Error while saving optimized rules to file: {e}")
+
+def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
+    """
+    Optimized generator that yields batches of words and initial hashes directly from disk.
+    Uses memory mapping and buffered reading for large files.
+    """
+    base_words_np = np.zeros((batch_size, max_len), dtype=np.uint8)
+    base_hashes = []
+    current_batch_count = 0
+    
+    print(f"🚀 Using optimized file reader for large wordlists...")
+    
+    try:
+        # Use a larger buffer for better I/O performance
+        with open(wordlist_path, 'r', encoding='latin-1', errors='ignore', buffering=8192*16) as f:
+            buffer = []
+            for line in f:
+                word_str = line.strip()
+                if not word_str:  # Skip empty lines
+                    continue
+                    
+                word = word_str.encode('latin-1')
+                
+                if 1 <= len(word) <= max_len:
+                    # Fill the numpy array directly
+                    base_words_np[current_batch_count, :len(word)] = np.frombuffer(word, dtype=np.uint8)
+                    base_hashes.append(fnv1a_hash_32_cpu(word))
+                    current_batch_count += 1
+
+                    if current_batch_count == batch_size:
+                        yield base_words_np.ravel().copy(), current_batch_count, np.array(base_hashes, dtype=np.uint32)
+                        base_words_np.fill(0)
+                        base_hashes = []
+                        current_batch_count = 0
+
+        # Yield remaining words
+        if current_batch_count > 0:
+            words_to_yield = base_words_np[:current_batch_count, :].ravel().copy()
+            yield words_to_yield, current_batch_count, np.array(base_hashes, dtype=np.uint32)
+            
+    except Exception as e:
+        print(f"❌ Error reading wordlist: {e}")
+        raise
 
 # ====================================================================
 # --- MEMORY MANAGEMENT FUNCTIONS ---
@@ -78,11 +302,13 @@ def get_gpu_memory_info(device):
         # Fallback to conservative defaults
         return 8 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024  # 8GB total, 6GB available
 
-def calculate_optimal_parameters(available_vram, total_words, cracked_hashes_count, reduction_factor=1.0):
+def calculate_optimal_parameters_large_rules(available_vram, total_words, cracked_hashes_count, total_rules, reduction_factor=1.0):
     """
-    Calculate optimal batch size and hash map sizes based on available VRAM
+    Calculate optimal parameters with consideration for large rule sets
     """
     print(f"🔧 Calculating optimal parameters for {available_vram / (1024**3):.1f} GB available VRAM")
+    print(f"📊 Dataset: {total_words:,} words, {total_rules:,} rules, {cracked_hashes_count:,} cracked hashes")
+    
     if reduction_factor < 1.0:
         print(f"📉 Applying memory reduction factor: {reduction_factor:.2f}")
     
@@ -100,6 +326,13 @@ def calculate_optimal_parameters(available_vram, total_words, cracked_hashes_cou
         (word_batch_bytes + hash_batch_bytes) * 2 +  # Double buffering
         rule_batch_bytes + counter_bytes
     )
+    
+    # Adjust batch size based on rule count to avoid too many iterations
+    if total_rules > 100000:
+        # For very large rule sets, use smaller batches to fit in memory
+        suggested_batch_size = min(DEFAULT_WORDS_PER_GPU_BATCH, 100000)
+    else:
+        suggested_batch_size = DEFAULT_WORDS_PER_GPU_BATCH
     
     # Available memory for hash maps
     available_for_maps = available_vram - base_memory
@@ -139,7 +372,7 @@ def calculate_optimal_parameters(available_vram, total_words, cracked_hashes_cou
         cracked_map_bytes = (1 << (cracked_bits - 5)) * np.uint32().itemsize
         total_map_memory = global_map_bytes + cracked_map_bytes
     
-    # Calculate optimal batch size
+    # Calculate optimal batch size considering rule count
     memory_per_word = (
         word_batch_bytes +  # base words
         hash_batch_bytes +  # base hashes
@@ -148,17 +381,24 @@ def calculate_optimal_parameters(available_vram, total_words, cracked_hashes_cou
     )
     
     max_batch_by_memory = int((available_vram - total_map_memory - base_memory) / memory_per_word)
-    optimal_batch_size = min(DEFAULT_WORDS_PER_GPU_BATCH, max_batch_by_memory)
+    optimal_batch_size = min(suggested_batch_size, max_batch_by_memory)
     optimal_batch_size = max(MIN_BATCH_SIZE, optimal_batch_size)
     
     # Round batch size to nearest multiple of LOCAL_WORK_SIZE for better performance
     optimal_batch_size = (optimal_batch_size // LOCAL_WORK_SIZE) * LOCAL_WORK_SIZE
     
+    # Adjust for very large rule sets
+    if total_rules > 50000:
+        # Reduce batch size slightly to accommodate more rules in memory
+        optimal_batch_size = max(MIN_BATCH_SIZE, optimal_batch_size // 2)
+    
     print(f"🎯 Optimal configuration:")
     print(f"   - Batch size: {optimal_batch_size:,} words")
+    print(f"   - Rules per batch: {MAX_RULES_IN_BATCH:,}")
     print(f"   - Global hash map: {global_bits} bits ({global_map_bytes / (1024**2):.1f} MB)")
     print(f"   - Cracked hash map: {cracked_bits} bits ({cracked_map_bytes / (1024**2):.1f} MB)")
     print(f"   - Total map memory: {total_map_memory / (1024**3):.2f} GB")
+    print(f"   - Estimated rule batches: {(total_rules + MAX_RULES_IN_BATCH - 1) // MAX_RULES_IN_BATCH}")
     
     return optimal_batch_size, global_bits, cracked_bits
 
@@ -204,14 +444,54 @@ def get_recommended_parameters(device, total_words, cracked_hashes_count):
         recommended_preset = "high_memory"
     
     # Calculate auto parameters
-    auto_batch, auto_global, auto_cracked = calculate_optimal_parameters(
-        available_vram, total_words, cracked_hashes_count
+    auto_batch, auto_global, auto_cracked = calculate_optimal_parameters_large_rules(
+        available_vram, total_words, cracked_hashes_count, total_words
     )
     recommendations["auto"]["batch_size"] = auto_batch
     recommendations["auto"]["global_bits"] = auto_global
     recommendations["auto"]["cracked_bits"] = auto_cracked
     
     return recommendations, recommended_preset
+
+def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLOCATION_RETRIES):
+    """
+    Create OpenCL buffers with retry logic for MEM_OBJECT_ALLOCATION_FAILURE
+    Returns: dict of buffer names to buffer objects
+    """
+    buffers = {}
+    current_reduction = 1.0
+    
+    for retry in range(max_retries + 1):
+        try:
+            print(f"🔄 Attempt {retry + 1}/{max_retries + 1} to allocate buffers (reduction: {current_reduction:.2f})")
+            
+            for name, spec in buffer_specs.items():
+                flags = spec['flags']
+                size = int(spec['size'] * current_reduction)
+                
+                if 'hostbuf' in spec:
+                    buffers[name] = cl.Buffer(context, flags, size, hostbuf=spec['hostbuf'])
+                else:
+                    buffers[name] = cl.Buffer(context, flags, size)
+            
+            print(f"✅ Successfully allocated all buffers on attempt {retry + 1}")
+            return buffers
+            
+        except cl.MemoryError as e:
+            if "MEM_OBJECT_ALLOCATION_FAILURE" in str(e) and retry < max_retries:
+                print(f"⚠️  Memory allocation failed, reducing memory usage...")
+                current_reduction *= MEMORY_REDUCTION_FACTOR
+                # Clean up any partially allocated buffers
+                for buf in buffers.values():
+                    try:
+                        buf.release()
+                    except:
+                        pass
+                buffers = {}
+            else:
+                raise e
+                
+    raise cl.MemoryError(f"Failed to allocate buffers after {max_retries} retries")
 
 # ====================================================================
 # --- KERNEL SOURCE ---
@@ -773,268 +1053,24 @@ void bfs_kernel(
 }}
 """
 
-# --- HELPER FUNCTIONS ---
+# ====================================================================
+# --- UPDATED MAIN RANKING FUNCTION FOR LARGE RULE SETS ---
+# ====================================================================
 
-def fnv1a_hash_32_cpu(data):
-    """Calculates FNV-1a hash for a byte array."""
-    hash_val = np.uint32(2166136261)
-    for byte in data:
-        hash_val ^= np.uint32(byte)
-        hash_val *= np.uint32(16777619)
-    return hash_val
-
-def get_word_count(path):
-    """Counts total words in file to set up progress bar."""
-    print(f"Counting words in: {path}...")
-    count = 0
-    try:
-        # Use memory mapping for large files
-        with open(path, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in f:
-                count += 1
-    except FileNotFoundError:
-        print(f"Error: Wordlist file not found at: {path}")
-        exit(1)
-
-    print(f"Total words found: {count:,}")
-    return count
-
-def load_rules(path):
-    """Loads Hashcat rules from file."""
-    print(f"Loading rules from: {path}...")
-    rules_list = []
-    rule_id_counter = 0
-    try:
-        with open(path, 'r', encoding='latin-1') as f:
-            for line in f:
-                rule = line.strip()
-                if not rule or rule.startswith('#'):
-                    continue
-                rules_list.append({'rule_data': rule, 'rule_id': rule_id_counter, 'uniqueness_score': 0, 'effectiveness_score': 0})
-                rule_id_counter += 1
-    except FileNotFoundError:
-        print(f"Error: Rules file not found at: {path}")
-        exit(1)
-
-    print(f"Loaded {len(rules_list)} rules.")
-    return rules_list
-
-def load_cracked_hashes(path, max_len):
-    """Loads a list of cracked passwords and returns their FNV-1a hashes."""
-    print(f"Loading cracked list for effectiveness check from: {path}...")
-    cracked_hashes = []
-    try:
-        # Optimized loading for large cracked lists
-        with open(path, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in f:
-                word = line.strip().encode('latin-1')
-                if 1 <= len(word) <= max_len:
-                    cracked_hashes.append(fnv1a_hash_32_cpu(word))
-    except FileNotFoundError:
-        print(f"Warning: Cracked list file not found at: {path}. Effectiveness scores will be zero.")
-        return np.array([], dtype=np.uint32)
-
-    unique_hashes = np.unique(np.array(cracked_hashes, dtype=np.uint32))
-    print(f"Loaded {len(unique_hashes):,} unique cracked password hashes.")
-    return unique_hashes
-
-def encode_rule(rule_str, rule_id, max_args):
-    """Encodes a rule as an array of uint32: [rule ID, arguments]"""
-    rule_size_in_int = 2 + max_args
-    encoded = np.zeros(rule_size_in_int, dtype=np.uint32)
-    encoded[0] = np.uint32(rule_id)
-    rule_chars = rule_str.encode('latin-1')
-    args_int = 0
-    
-    # Pack up to 4 bytes into first integer
-    for i, byte in enumerate(rule_chars[:4]):
-        args_int |= (byte << (i * 8))
-    
-    encoded[1] = np.uint32(args_int)
-    
-    # Pack remaining bytes into second integer
-    if len(rule_chars) > 4:
-        args_int2 = 0
-        for i, byte in enumerate(rule_chars[4:8]):
-            args_int2 |= (byte << (i * 8))
-        encoded[2] = np.uint32(args_int2)
-    
-    return encoded
-
-def save_ranking_data(ranking_list, output_path):
-    """Saves the scoring and ranking data to a separate CSV file."""
-    ranking_output_path = output_path
-    
-    print(f"Saving rule ranking data to: {ranking_output_path}...")
-
-    # Calculate a combined score for ranking
-    for rule in ranking_list:
-        rule['combined_score'] = rule.get('effectiveness_score', 0) * 10 + rule.get('uniqueness_score', 0)
-
-    # Filtering and sorting
-    ranked_rules = [rule for rule in ranking_list if rule.get('combined_score', 0) > 0]
-    ranked_rules.sort(key=lambda rule: rule['combined_score'], reverse=True)
-
-    if not ranked_rules:
-        print("❌ No rules had a positive combined score. Ranking file not created.")
-        return None
-
-    try:
-        with open(ranking_output_path, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 'Rule_Data']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-
-            for rank, rule in enumerate(ranked_rules, 1):
-                writer.writerow({
-                    'Rank': rank,
-                    'Combined_Score': rule['combined_score'],
-                    'Effectiveness_Score': rule.get('effectiveness_score', 0),
-                    'Uniqueness_Score': rule.get('uniqueness_score', 0),
-                    'Rule_Data': rule['rule_data']
-                })
-
-        print(f"✅ Ranking data saved successfully to {ranking_output_path}.")
-        return ranking_output_path
-    except Exception as e:
-        print(f"❌ Error while saving ranking data to CSV file: {e}")
-        return None
-
-def load_and_save_optimized_rules(csv_path, output_path, top_k):
-    """Loads ranking data from a CSV, sorts, and saves the Top K rules."""
-    if not csv_path:
-        print("\nOptimization skipped: Ranking CSV path is missing.")
-        return
-
-    print(f"\nLoading ranking from CSV: {csv_path} and saving Top {top_k} Optimized Rules to: {output_path}...")
-    
-    ranked_data = []
-    try:
-        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    row['Combined_Score'] = int(row['Combined_Score'])
-                    ranked_data.append(row)
-                except ValueError:
-                    continue
-    except FileNotFoundError:
-        print(f"❌ Error: Ranking CSV file not found at: {csv_path}")
-        return
-    except Exception as e:
-        print(f"❌ Error while reading CSV: {e}")
-        return
-
-    ranked_data.sort(key=lambda row: row['Combined_Score'], reverse=True)
-    final_optimized_list = ranked_data[:top_k]
-
-    if not final_optimized_list:
-        print("❌ No rules available after sorting/filtering. Optimized rule file not created.")
-        return
-
-    try:
-        with open(output_path, 'w', newline='\n', encoding='utf-8') as f:
-            f.write(":\n")
-            for rule in final_optimized_list:
-                f.write(f"{rule['Rule_Data']}\n")
-        print(f"✅ Top {len(final_optimized_list)} optimized rules saved successfully to {output_path}.")
-    except Exception as e:
-        print(f"❌ Error while saving optimized rules to file: {e}")
-
-def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
-    """
-    Optimized generator that yields batches of words and initial hashes directly from disk.
-    Uses memory mapping and buffered reading for large files.
-    """
-    base_words_np = np.zeros((batch_size, max_len), dtype=np.uint8)
-    base_hashes = []
-    current_batch_count = 0
-    
-    print(f"🚀 Using optimized file reader for large wordlists...")
-    
-    try:
-        # Use a larger buffer for better I/O performance
-        with open(wordlist_path, 'r', encoding='latin-1', errors='ignore', buffering=8192*16) as f:
-            buffer = []
-            for line in f:
-                word_str = line.strip()
-                if not word_str:  # Skip empty lines
-                    continue
-                    
-                word = word_str.encode('latin-1')
-                
-                if 1 <= len(word) <= max_len:
-                    # Fill the numpy array directly
-                    base_words_np[current_batch_count, :len(word)] = np.frombuffer(word, dtype=np.uint8)
-                    base_hashes.append(fnv1a_hash_32_cpu(word))
-                    current_batch_count += 1
-
-                    if current_batch_count == batch_size:
-                        yield base_words_np.ravel().copy(), current_batch_count, np.array(base_hashes, dtype=np.uint32)
-                        base_words_np.fill(0)
-                        base_hashes = []
-                        current_batch_count = 0
-
-        # Yield remaining words
-        if current_batch_count > 0:
-            words_to_yield = base_words_np[:current_batch_count, :].ravel().copy()
-            yield words_to_yield, current_batch_count, np.array(base_hashes, dtype=np.uint32)
-            
-    except Exception as e:
-        print(f"❌ Error reading wordlist: {e}")
-        raise
-
-def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLOCATION_RETRIES):
-    """
-    Create OpenCL buffers with retry logic for MEM_OBJECT_ALLOCATION_FAILURE
-    Returns: dict of buffer names to buffer objects
-    """
-    buffers = {}
-    current_reduction = 1.0
-    
-    for retry in range(max_retries + 1):
-        try:
-            print(f"🔄 Attempt {retry + 1}/{max_retries + 1} to allocate buffers (reduction: {current_reduction:.2f})")
-            
-            for name, spec in buffer_specs.items():
-                flags = spec['flags']
-                size = int(spec['size'] * current_reduction)
-                
-                if 'hostbuf' in spec:
-                    buffers[name] = cl.Buffer(context, flags, size, hostbuf=spec['hostbuf'])
-                else:
-                    buffers[name] = cl.Buffer(context, flags, size)
-            
-            print(f"✅ Successfully allocated all buffers on attempt {retry + 1}")
-            return buffers
-            
-        except cl.MemoryError as e:
-            if "MEM_OBJECT_ALLOCATION_FAILURE" in str(e) and retry < max_retries:
-                print(f"⚠️  Memory allocation failed, reducing memory usage...")
-                current_reduction *= MEMORY_REDUCTION_FACTOR
-                # Clean up any partially allocated buffers
-                for buf in buffers.values():
-                    try:
-                        buf.release()
-                    except:
-                        pass
-                buffers = {}
-            else:
-                raise e
-                
-    raise cl.MemoryError(f"Failed to allocate buffers after {max_retries} retries")
-
-# --- MAIN RANKING FUNCTION ---
-
-def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
-                         words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
-                         preset=None):
+def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
+                               words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
+                               preset=None):
     start_time = time()
     
     # 0. PRELIMINARY DATA LOADING FOR MEMORY CALCULATION
     total_words = get_word_count(wordlist_path)
     rules_list = load_rules(rules_path)
     total_rules = len(rules_list)
+    
+    # Check if we're dealing with a large rule set
+    if total_rules > 100000:
+        print(f"🚀 LARGE RULE SET DETECTED: {total_rules:,} rules")
+        print("   Using optimized processing for large rule sets...")
     
     # Load cracked hashes ONCE for both memory calculation and processing
     cracked_hashes_np = load_cracked_hashes(cracked_list_path, MAX_WORD_LEN)
@@ -1111,9 +1147,9 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
                 print(f"   Available: {available_vram / (1024**3):.2f} GB")
                 print("   Consider reducing batch size or hash map bits")
         else:
-            # Auto-calculate optimal parameters
-            words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters(
-                available_vram, total_words, cracked_hashes_count
+            # Auto-calculate optimal parameters with large rule set consideration
+            words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters_large_rules(
+                available_vram, total_words, cracked_hashes_count, total_rules
             )
 
         # Calculate derived constants
@@ -1173,7 +1209,7 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
             'flags': mf.READ_ONLY,
             'size': words_per_gpu_batch * np.uint32().itemsize
         },
-        # Rule input buffer
+        # Rule input buffer (INCREASED CAPACITY)
         'rules_in': {
             'flags': mf.READ_ONLY,
             'size': MAX_RULES_IN_BATCH * rule_size_in_int * np.uint32().itemsize
@@ -1188,7 +1224,7 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
             'flags': mf.READ_ONLY,
             'size': cracked_hash_map_np.nbytes
         },
-        # Rule Counters
+        # Rule Counters (INCREASED CAPACITY)
         'rule_uniqueness_counts': {
             'flags': mf.READ_WRITE,
             'size': counters_size
@@ -1251,6 +1287,9 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     word_iterator = wordlist_iterator_optimized(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
     
+    print(f"📊 Processing {total_rules:,} rules in {len(rule_batch_starts):,} batches "
+          f"(up to {MAX_RULES_IN_BATCH:,} rules per batch)")
+    
     # Use numpy arrays for counters to avoid overflow
     words_processed_total = np.uint64(0)
     total_unique_found = np.uint64(0)
@@ -1262,6 +1301,7 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     num_words_batch_exec = 0
     
     word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist from disk [Unique: 0 | Cracked: 0]", unit=" word")
+    rule_batch_pbar = tqdm(total=len(rule_batch_starts), desc="Rule batches processed", unit=" batch")
 
     # A. Initial word batch load
     try:
@@ -1271,6 +1311,7 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     except StopIteration:
         print("Wordlist is empty or too small.")
         word_batch_pbar.close()
+        rule_batch_pbar.close()
         return
 
     # B. Main Pipelined Loop
@@ -1336,6 +1377,8 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
                 total_unique_found += np.uint64(uniqueness_val)
                 total_cracked_found += np.uint64(effectiveness_val)
 
+            rule_batch_pbar.update(1)
+
         # 9. UPDATE AND PREPARE NEXT ITERATION
         words_processed_total += np.uint64(num_words_batch_exec)
         word_batch_pbar.update(num_words_batch_exec)
@@ -1348,11 +1391,13 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
         num_words_batch_exec = num_words_batch_next
 
     word_batch_pbar.close()
+    rule_batch_pbar.close()
     end_time = time()
     
     # 10. FINAL REPORTING AND SAVING
     print("\n--- Final Results Summary ---")
     print(f"Total Words Processed: {int(words_processed_total):,}")
+    print(f"Total Rules Processed: {total_rules:,}")
     print(f"Total Unique Words Generated: {int(total_unique_found):,}")
     print(f"Total True Cracks Found: {int(total_cracked_found):,}")
     print(f"Total Execution Time: {end_time - start_time:.2f} seconds")
@@ -1363,15 +1408,19 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
         optimized_output_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
         load_and_save_optimized_rules(csv_path, optimized_output_path, top_k)
 
+# ====================================================================
+# --- MAIN EXECUTION ---
+# ====================================================================
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.0)")
+    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.1 - Large Rule Support)")
     parser.add_argument('-w', '--wordlist', required=True, help='Path to the base wordlist file.')
     parser.add_argument('-r', '--rules', required=True, help='Path to the Hashcat rules file to rank.')
     parser.add_argument('-c', '--cracked', required=True, help='Path to a list of cracked passwords for effectiveness scoring.')
     parser.add_argument('-o', '--output', default='ranker_output.csv', help='Path to save the final ranking CSV.')
     parser.add_argument('-k', '--topk', type=int, default=1000, help='Number of top rules to save to an optimized .rule file. Set to 0 to skip.')
     
-    # Performance tuning flags (now optional - will be auto-calculated if not provided)
+    # Performance tuning flags
     parser.add_argument('--batch-size', type=int, default=None, 
                        help=f'Number of words to process in each GPU batch (default: auto-calculate based on VRAM)')
     parser.add_argument('--global-bits', type=int, default=None,
@@ -1385,7 +1434,15 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    rank_rules_uniqueness(
+    print("=" * 70)
+    print("* RANKER v3.1 - FIXED VERSION")
+    print("* FIXED: Now saves ALL rules as requested by -k parameter")
+    print("* FIXED: Removed filtering that excluded zero-score rules")
+    print("* IMPROVED: MAX_RULES_IN_BATCH increased to 1024")
+    print("* ENHANCED: Better memory management for large rule sets")
+    print("=" * 70)
+
+    rank_rules_uniqueness_large(
         wordlist_path=args.wordlist,
         rules_path=args.rules,
         cracked_list_path=args.cracked,
