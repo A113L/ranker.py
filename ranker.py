@@ -915,9 +915,9 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     rules_list = load_rules(rules_path)
     total_rules = len(rules_list)
     
-    # Load cracked hashes to get count for memory calculation
-    cracked_hashes_sample = load_cracked_hashes(cracked_list_path, MAX_WORD_LEN)
-    cracked_hashes_count = len(cracked_hashes_sample)
+    # Load cracked hashes ONCE for both memory calculation and processing
+    cracked_hashes_np = load_cracked_hashes(cracked_list_path, MAX_WORD_LEN)
+    cracked_hashes_count = len(cracked_hashes_np)
     
     # 1. OPENCL INITIALIZATION AND MEMORY DETECTION
     try:
@@ -935,16 +935,47 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
         print(f"💾 Total VRAM: {total_vram / (1024**3):.1f} GB")
         print(f"💾 Available VRAM: {available_vram / (1024**3):.1f} GB")
         
-        # Calculate optimal parameters if not specified
-        if words_per_gpu_batch is None or global_hash_map_bits is None or cracked_hash_map_bits is None:
-            words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters(
-                available_vram, total_words, cracked_hashes_count
-            )
-        else:
-            print(f"🔧 Using user-specified parameters:")
+        # Handle manual parameter specification
+        using_manual_params = False
+        if words_per_gpu_batch is not None or global_hash_map_bits is not None or cracked_hash_map_bits is not None:
+            using_manual_params = True
+            print(f"🔧 Using manually specified parameters:")
+            
+            # Set defaults for any unspecified manual parameters
+            if words_per_gpu_batch is None:
+                words_per_gpu_batch = DEFAULT_WORDS_PER_GPU_BATCH
+            if global_hash_map_bits is None:
+                global_hash_map_bits = DEFAULT_GLOBAL_HASH_MAP_BITS
+            if cracked_hash_map_bits is None:
+                cracked_hash_map_bits = DEFAULT_CRACKED_HASH_MAP_BITS
+                
             print(f"   - Batch size: {words_per_gpu_batch:,}")
             print(f"   - Global hash map: {global_hash_map_bits} bits")
             print(f"   - Cracked hash map: {cracked_hash_map_bits} bits")
+            
+            # Validate manual parameters against available VRAM
+            global_map_bytes = (1 << (global_hash_map_bits - 5)) * np.uint32().itemsize
+            cracked_map_bytes = (1 << (cracked_hash_map_bits - 5)) * np.uint32().itemsize
+            total_map_memory = global_map_bytes + cracked_map_bytes
+            
+            # Memory requirements for batch processing
+            word_batch_bytes = words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
+            hash_batch_bytes = words_per_gpu_batch * np.uint32().itemsize
+            rule_batch_bytes = MAX_RULES_IN_BATCH * (2 + MAX_RULE_ARGS) * np.uint32().itemsize
+            counter_bytes = MAX_RULES_IN_BATCH * np.uint32().itemsize * 2
+            
+            total_batch_memory = (word_batch_bytes + hash_batch_bytes) * 2 + rule_batch_bytes + counter_bytes + total_map_memory
+            
+            if total_batch_memory > available_vram:
+                print(f"⚠️  Warning: Manual parameters exceed available VRAM!")
+                print(f"   Required: {total_batch_memory / (1024**3):.2f} GB")
+                print(f"   Available: {available_vram / (1024**3):.2f} GB")
+                print("   Consider reducing batch size or hash map bits")
+        else:
+            # Auto-calculate optimal parameters
+            words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters(
+                available_vram, total_words, cracked_hashes_count
+            )
 
         # Calculate derived constants
         GLOBAL_HASH_MAP_WORDS = 1 << (global_hash_map_bits - 5)
@@ -971,9 +1002,6 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     rule_size_in_int = 2 + MAX_RULE_ARGS
     encoded_rules = [encode_rule(rule['rule_data'], rule['rule_id'], MAX_RULE_ARGS) for rule in rules_list]
 
-    # Reload cracked hashes for actual processing
-    cracked_hashes_np = load_cracked_hashes(cracked_list_path, MAX_WORD_LEN)
-    
     # 3. HASH MAP INITIALIZATION
     global_hash_map_np = np.zeros(GLOBAL_HASH_MAP_WORDS, dtype=np.uint32)
     print(f"📝 Global Hash Map initialized: {global_hash_map_np.nbytes / (1024*1024):.2f} MB allocated.")
