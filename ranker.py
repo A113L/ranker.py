@@ -1151,6 +1151,9 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     # 4. OPENCL BUFFER SETUP WITH RETRY LOGIC
     mf = cl.mem_flags
 
+    # Define counters_size here - this was the missing variable
+    counters_size = MAX_RULES_IN_BATCH * np.uint32().itemsize
+
     # Define buffer specifications for retry logic
     buffer_specs = {
         # Double buffering for words and hashes
@@ -1188,11 +1191,11 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
         # Rule Counters
         'rule_uniqueness_counts': {
             'flags': mf.READ_WRITE,
-            'size': MAX_RULES_IN_BATCH * np.uint32().itemsize
+            'size': counters_size
         },
         'rule_effectiveness_counts': {
             'flags': mf.READ_WRITE,
-            'size': MAX_RULES_IN_BATCH * np.uint32().itemsize
+            'size': counters_size
         }
     }
 
