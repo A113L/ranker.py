@@ -42,6 +42,10 @@ VRAM_SAFETY_MARGIN = 0.15  # 15% safety margin
 MIN_BATCH_SIZE = 50000     # Minimum batch size to maintain performance
 MIN_HASH_MAP_BITS = 28     # Minimum hash map size (256MB)
 
+# Memory reduction factors for allocation failures
+MEMORY_REDUCTION_FACTOR = 0.7  # Reduce memory by 30% on each retry
+MAX_ALLOCATION_RETRIES = 5     # Maximum retries for memory allocation
+
 # Rule IDs
 START_ID_SIMPLE = 0
 NUM_SIMPLE_RULES = 10
@@ -74,11 +78,16 @@ def get_gpu_memory_info(device):
         # Fallback to conservative defaults
         return 8 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024  # 8GB total, 6GB available
 
-def calculate_optimal_parameters(available_vram, total_words, cracked_hashes_count):
+def calculate_optimal_parameters(available_vram, total_words, cracked_hashes_count, reduction_factor=1.0):
     """
     Calculate optimal batch size and hash map sizes based on available VRAM
     """
     print(f"🔧 Calculating optimal parameters for {available_vram / (1024**3):.1f} GB available VRAM")
+    if reduction_factor < 1.0:
+        print(f"📉 Applying memory reduction factor: {reduction_factor:.2f}")
+    
+    # Apply reduction factor
+    available_vram = int(available_vram * reduction_factor)
     
     # Memory requirements per component (in bytes)
     word_batch_bytes = MAX_WORD_LEN * np.uint8().itemsize
@@ -152,6 +161,57 @@ def calculate_optimal_parameters(available_vram, total_words, cracked_hashes_cou
     print(f"   - Total map memory: {total_map_memory / (1024**3):.2f} GB")
     
     return optimal_batch_size, global_bits, cracked_bits
+
+def get_recommended_parameters(device, total_words, cracked_hashes_count):
+    """
+    Get recommended parameter values based on GPU capabilities and dataset size
+    """
+    total_vram, available_vram = get_gpu_memory_info(device)
+    
+    recommendations = {
+        "low_memory": {
+            "description": "Low Memory Mode (for GPUs with < 4GB VRAM)",
+            "batch_size": 50000,
+            "global_bits": 30,
+            "cracked_bits": 28
+        },
+        "medium_memory": {
+            "description": "Medium Memory Mode (for GPUs with 4-8GB VRAM)",
+            "batch_size": 150000,
+            "global_bits": 33,
+            "cracked_bits": 31
+        },
+        "high_memory": {
+            "description": "High Memory Mode (for GPUs with > 8GB VRAM)",
+            "batch_size": 300000,
+            "global_bits": 35,
+            "cracked_bits": 33
+        },
+        "auto": {
+            "description": "Auto-calculated (Recommended)",
+            "batch_size": None,
+            "global_bits": None,
+            "cracked_bits": None
+        }
+    }
+    
+    # Determine which preset to recommend
+    if total_vram < 4 * 1024**3:
+        recommended_preset = "low_memory"
+    elif total_vram < 8 * 1024**3:
+        recommended_preset = "medium_memory"
+    else:
+        recommended_preset = "high_memory"
+    
+    # Calculate auto parameters
+    auto_batch, auto_global, auto_cracked = calculate_optimal_parameters(
+        available_vram, total_words, cracked_hashes_count
+    )
+    recommendations["auto"]["batch_size"] = auto_batch
+    recommendations["auto"]["global_bits"] = auto_global
+    recommendations["auto"]["cracked_bits"] = auto_cracked
+    
+    return recommendations, recommended_preset
 
 # ====================================================================
 # --- KERNEL SOURCE ---
@@ -924,10 +984,51 @@ def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
         print(f"❌ Error reading wordlist: {e}")
         raise
 
+def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLOCATION_RETRIES):
+    """
+    Create OpenCL buffers with retry logic for MEM_OBJECT_ALLOCATION_FAILURE
+    Returns: dict of buffer names to buffer objects
+    """
+    buffers = {}
+    current_reduction = 1.0
+    
+    for retry in range(max_retries + 1):
+        try:
+            print(f"🔄 Attempt {retry + 1}/{max_retries + 1} to allocate buffers (reduction: {current_reduction:.2f})")
+            
+            for name, spec in buffer_specs.items():
+                flags = spec['flags']
+                size = int(spec['size'] * current_reduction)
+                
+                if 'hostbuf' in spec:
+                    buffers[name] = cl.Buffer(context, flags, size, hostbuf=spec['hostbuf'])
+                else:
+                    buffers[name] = cl.Buffer(context, flags, size)
+            
+            print(f"✅ Successfully allocated all buffers on attempt {retry + 1}")
+            return buffers
+            
+        except cl.MemoryError as e:
+            if "MEM_OBJECT_ALLOCATION_FAILURE" in str(e) and retry < max_retries:
+                print(f"⚠️  Memory allocation failed, reducing memory usage...")
+                current_reduction *= MEMORY_REDUCTION_FACTOR
+                # Clean up any partially allocated buffers
+                for buf in buffers.values():
+                    try:
+                        buf.release()
+                    except:
+                        pass
+                buffers = {}
+            else:
+                raise e
+                
+    raise cl.MemoryError(f"Failed to allocate buffers after {max_retries} retries")
+
 # --- MAIN RANKING FUNCTION ---
 
 def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
-                         words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None):
+                         words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
+                         preset=None):
     start_time = time()
     
     # 0. PRELIMINARY DATA LOADING FOR MEMORY CALCULATION
@@ -954,6 +1055,24 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
         print(f"🎮 GPU: {device.name.strip()}")
         print(f"💾 Total VRAM: {total_vram / (1024**3):.1f} GB")
         print(f"💾 Available VRAM: {available_vram / (1024**3):.1f} GB")
+        
+        # Handle preset parameter specification
+        if preset:
+            recommendations, recommended_preset = get_recommended_parameters(device, total_words, cracked_hashes_count)
+            
+            if preset == "recommend":
+                print(f"🎯 Recommended preset: {recommended_preset}")
+                preset = recommended_preset
+            
+            if preset in recommendations:
+                preset_config = recommendations[preset]
+                print(f"🔧 Using {preset_config['description']}")
+                words_per_gpu_batch = preset_config['batch_size']
+                global_hash_map_bits = preset_config['global_bits']
+                cracked_hash_map_bits = preset_config['cracked_bits']
+            else:
+                print(f"❌ Unknown preset: {preset}. Available presets: {list(recommendations.keys())}")
+                return
         
         # Handle manual parameter specification
         using_manual_params = False
@@ -1029,36 +1148,89 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     cracked_hash_map_np = np.zeros(CRACKED_HASH_MAP_WORDS, dtype=np.uint32)
     print(f"📝 Cracked Hash Map initialized: {cracked_hash_map_np.nbytes / (1024*1024):.2f} MB allocated.")
 
-    # 4. OPENCL BUFFER SETUP
+    # 4. OPENCL BUFFER SETUP WITH RETRY LOGIC
     mf = cl.mem_flags
 
-    # A) Base Word & Hash Input Buffer (Double Buffering)
-    base_words_size = words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
-    base_words_in_g = [cl.Buffer(context, mf.READ_ONLY, base_words_size), cl.Buffer(context, mf.READ_ONLY, base_words_size)]
-    base_hashes_size = words_per_gpu_batch * np.uint32().itemsize
-    base_hashes_g = [cl.Buffer(context, mf.READ_ONLY, base_hashes_size), cl.Buffer(context, mf.READ_ONLY, base_hashes_size)]
-    
+    # Define buffer specifications for retry logic
+    buffer_specs = {
+        # Double buffering for words and hashes
+        'base_words_in_0': {
+            'flags': mf.READ_ONLY,
+            'size': words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
+        },
+        'base_words_in_1': {
+            'flags': mf.READ_ONLY,
+            'size': words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
+        },
+        'base_hashes_0': {
+            'flags': mf.READ_ONLY,
+            'size': words_per_gpu_batch * np.uint32().itemsize
+        },
+        'base_hashes_1': {
+            'flags': mf.READ_ONLY,
+            'size': words_per_gpu_batch * np.uint32().itemsize
+        },
+        # Rule input buffer
+        'rules_in': {
+            'flags': mf.READ_ONLY,
+            'size': MAX_RULES_IN_BATCH * rule_size_in_int * np.uint32().itemsize
+        },
+        # Global Hash Map (RW for base wordlist check)
+        'global_hash_map': {
+            'flags': mf.READ_WRITE,
+            'size': global_hash_map_np.nbytes
+        },
+        # Cracked Hash Map (Read Only, filled once)
+        'cracked_hash_map': {
+            'flags': mf.READ_ONLY,
+            'size': cracked_hash_map_np.nbytes
+        },
+        # Rule Counters
+        'rule_uniqueness_counts': {
+            'flags': mf.READ_WRITE,
+            'size': MAX_RULES_IN_BATCH * np.uint32().itemsize
+        },
+        'rule_effectiveness_counts': {
+            'flags': mf.READ_WRITE,
+            'size': MAX_RULES_IN_BATCH * np.uint32().itemsize
+        }
+    }
+
+    # Add hostbuf for cracked hash map if available
+    if cracked_hashes_np.size > 0:
+        buffer_specs['cracked_temp'] = {
+            'flags': mf.READ_ONLY | mf.COPY_HOST_PTR,
+            'size': cracked_hashes_np.nbytes,
+            'hostbuf': cracked_hashes_np
+        }
+
+    try:
+        buffers = create_opencl_buffers_with_retry(context, buffer_specs)
+        
+        # Extract buffers for easier access
+        base_words_in_g = [buffers['base_words_in_0'], buffers['base_words_in_1']]
+        base_hashes_g = [buffers['base_hashes_0'], buffers['base_hashes_1']]
+        rules_in_g = buffers['rules_in']
+        global_hash_map_g = buffers['global_hash_map']
+        cracked_hash_map_g = buffers['cracked_hash_map']
+        rule_uniqueness_counts_g = buffers['rule_uniqueness_counts']
+        rule_effectiveness_counts_g = buffers['rule_effectiveness_counts']
+        cracked_temp_g = buffers.get('cracked_temp', None)
+        
+    except cl.MemoryError as e:
+        print(f"❌ Fatal: Could not allocate GPU memory even after retries: {e}")
+        print("💡 Try reducing batch size or hash map bits, or use a preset:")
+        recommendations, _ = get_recommended_parameters(device, total_words, cracked_hashes_count)
+        for preset_name, config in recommendations.items():
+            if preset_name != "auto":
+                print(f"   --preset {preset_name}: {config['description']}")
+        return
+
     current_word_buffer_idx = 0
     copy_events = [None, None]
 
-    # C) Rule Input Buffer
-    rule_batch_byte_size = MAX_RULES_IN_BATCH * rule_size_in_int * np.uint32().itemsize
-    rules_in_g = cl.Buffer(context, mf.READ_ONLY, rule_batch_byte_size)
-
-    # D) Global Hash Map (RW for base wordlist check)
-    global_hash_map_g = cl.Buffer(context, mf.READ_WRITE, global_hash_map_np.nbytes)
-
-    # E) Cracked Hash Map (Read Only, filled once)
-    cracked_hash_map_g = cl.Buffer(context, mf.READ_ONLY, cracked_hash_map_np.nbytes)
-
-    # F) Rule Counters
-    counters_size = MAX_RULES_IN_BATCH * np.uint32().itemsize
-    rule_uniqueness_counts_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
-    rule_effectiveness_counts_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
-
     # 5. INITIALIZE CRACKED HASH MAP (ONCE)
-    if cracked_hashes_np.size > 0:
-        cracked_temp_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cracked_hashes_np)
+    if cracked_hashes_np.size > 0 and cracked_temp_g is not None:
         global_size_init_cracked = (int(math.ceil(cracked_hashes_np.size / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
         local_size_init_cracked = (LOCAL_WORK_SIZE,)
 
@@ -1204,6 +1376,10 @@ if __name__ == '__main__':
     parser.add_argument('--cracked-bits', type=int, default=None,
                        help=f'Bits for cracked hash map size (default: auto-calculate based on VRAM)')
     
+    # New preset argument for easy configuration
+    parser.add_argument('--preset', type=str, default=None,
+                       help='Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)')
+    
     args = parser.parse_args()
 
     rank_rules_uniqueness(
@@ -1214,5 +1390,6 @@ if __name__ == '__main__':
         top_k=args.topk,
         words_per_gpu_batch=args.batch_size,
         global_hash_map_bits=args.global_bits,
-        cracked_hash_map_bits=args.cracked_bits
+        cracked_hash_map_bits=args.cracked_bits,
+        preset=args.preset
     )
