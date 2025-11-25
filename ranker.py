@@ -13,6 +13,29 @@ import mmap
 # --- RANKER v3.1: IMPROVED CAPACITY FOR LARGE RULE SETS ---
 # ====================================================================
 
+# --- COLOR CODES FOR TERMINAL OUTPUT ---
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+# Color functions for easy use
+def red(text): return f"{Colors.RED}{text}{Colors.END}"
+def green(text): return f"{Colors.GREEN}{text}{Colors.END}"
+def yellow(text): return f"{Colors.YELLOW}{text}{Colors.END}"
+def blue(text): return f"{Colors.BLUE}{text}{Colors.END}"
+def magenta(text): return f"{Colors.MAGENTA}{text}{Colors.END}"
+def cyan(text): return f"{Colors.CYAN}{text}{Colors.END}"
+def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
+def underline(text): return f"{Colors.UNDERLINE}{text}{Colors.END}"
+
 # --- WARNING FILTERS ---
 warnings.filterwarnings("ignore", message="overflow encountered in scalar multiply")
 warnings.filterwarnings("ignore", message="overflow encountered in scalar add")
@@ -66,13 +89,13 @@ NUM_NEW_RULES = 13
 
 def get_word_count(path):
     """Counts total words in file to set up progress bar."""
-    print(f"Counting words in: {path}...")
+    print(f"{blue('📊')} {bold('Counting words in:')} {path}...")
     
     # Get file size for timing estimates
     try:
         file_size = os.path.getsize(path) / (1024 * 1024)  # Size in MB
         if file_size > 100:
-            print(f"📁 Large wordlist detected: {file_size:.1f} MB - this may take a moment...")
+            print(f"{yellow('📁')} {bold('Large wordlist detected:')} {file_size:.1f} MB - this may take a moment...")
     except OSError:
         file_size = 0
     
@@ -83,28 +106,28 @@ def get_word_count(path):
             for line in f:
                 count += 1
     except FileNotFoundError:
-        print(f"Error: Wordlist file not found at: {path}")
+        print(f"{red('❌')} {bold('Error:')} Wordlist file not found at: {path}")
         exit(1)
     
     count_time = time() - start_count
-    print(f"✅ Total words found: {count:,} (counting took {count_time:.2f}s)")
+    print(f"{green('✅')} {bold('Total words found:')} {cyan(f'{count:,}')} (counting took {count_time:.2f}s)")
     
     # Provide timing estimates for large files
     if file_size > 100 and count_time > 5:
         estimated_load_time = count_time * 2
-        print(f"⏱️  For {file_size:.1f}MB file, full loading will take approximately {estimated_load_time:.1f}s")
+        print(f"{yellow('⏱️')}  {bold('For')} {file_size:.1f}MB {bold('file, full loading will take approximately')} {estimated_load_time:.1f}s")
     
     return count
 
 def load_rules(path):
     """Loads Hashcat rules from file."""
-    print(f"Loading rules from: {path}...")
+    print(f"{blue('📊')} {bold('Loading rules from:')} {path}...")
     
     # Get file size for rules too
     try:
         rules_size = os.path.getsize(path) / (1024 * 1024)  # Size in MB
         if rules_size > 10:
-            print(f"📁 Large rules file detected: {rules_size:.1f} MB")
+            print(f"{yellow('📁')} {bold('Large rules file detected:')} {rules_size:.1f} MB")
     except OSError:
         rules_size = 0
     
@@ -119,10 +142,10 @@ def load_rules(path):
                 rules_list.append({'rule_data': rule, 'rule_id': rule_id_counter, 'uniqueness_score': 0, 'effectiveness_score': 0})
                 rule_id_counter += 1
     except FileNotFoundError:
-        print(f"Error: Rules file not found at: {path}")
+        print(f"{red('❌')} {bold('Error:')} Rules file not found at: {path}")
         exit(1)
 
-    print(f"Loaded {len(rules_list)} rules.")
+    print(f"{green('✅')} {bold('Loaded')} {cyan(f'{len(rules_list):,}')} {bold('rules.')}")
     return rules_list
 
 def fnv1a_hash_32_cpu(data):
@@ -135,13 +158,13 @@ def fnv1a_hash_32_cpu(data):
 
 def load_cracked_hashes(path, max_len):
     """Loads a list of cracked passwords and returns their FNV-1a hashes."""
-    print(f"Loading cracked list for effectiveness check from: {path}...")
+    print(f"{blue('📊')} {bold('Loading cracked list for effectiveness check from:')} {path}...")
     
     # Get file size
     try:
         cracked_size = os.path.getsize(path) / (1024 * 1024)  # Size in MB
         if cracked_size > 50:
-            print(f"📁 Large cracked list detected: {cracked_size:.1f} MB - loading...")
+            print(f"{yellow('📁')} {bold('Large cracked list detected:')} {cracked_size:.1f} MB - loading...")
     except OSError:
         cracked_size = 0
     
@@ -154,16 +177,16 @@ def load_cracked_hashes(path, max_len):
                 if 1 <= len(word) <= max_len:
                     cracked_hashes.append(fnv1a_hash_32_cpu(word))
     except FileNotFoundError:
-        print(f"Warning: Cracked list file not found at: {path}. Effectiveness scores will be zero.")
+        print(f"{yellow('⚠️')} {bold('Warning:')} Cracked list file not found at: {path}. Effectiveness scores will be zero.")
         return np.array([], dtype=np.uint32)
 
     load_time = time() - load_start
     unique_hashes = np.unique(np.array(cracked_hashes, dtype=np.uint32))
     
     if cracked_size > 50:
-        print(f"✅ Cracked list loaded: {len(unique_hashes):,} unique hashes in {load_time:.2f}s")
+        print(f"{green('✅')} {bold('Cracked list loaded:')} {cyan(f'{len(unique_hashes):,}')} {bold('unique hashes in')} {load_time:.2f}s")
     else:
-        print(f"Loaded {len(unique_hashes):,} unique cracked password hashes.")
+        print(f"{green('✅')} {bold('Loaded')} {cyan(f'{len(unique_hashes):,}')} {bold('unique cracked password hashes.')}")
         
     return unique_hashes
 
@@ -194,7 +217,7 @@ def save_ranking_data(ranking_list, output_path):
     """Saves the scoring and ranking data to a separate CSV file."""
     ranking_output_path = output_path
     
-    print(f"Saving rule ranking data to: {ranking_output_path}...")
+    print(f"{blue('💾')} {bold('Saving rule ranking data to:')} {ranking_output_path}...")
 
     # Calculate a combined score for ranking
     for rule in ranking_list:
@@ -205,10 +228,10 @@ def save_ranking_data(ranking_list, output_path):
     
     ranked_rules.sort(key=lambda rule: rule['combined_score'], reverse=True)
 
-    print(f"💾 Saving ALL {len(ranked_rules):,} rules (including zero-score rules)")
+    print(f"{blue('💾')} {bold('Saving ALL')} {cyan(f'{len(ranked_rules):,}')} {bold('rules (including zero-score rules)')}")
 
     if not ranked_rules:
-        print("❌ No rules to save. Ranking file not created.")
+        print(f"{red('❌')} {bold('No rules to save. Ranking file not created.')}")
         return None
 
     try:
@@ -226,19 +249,19 @@ def save_ranking_data(ranking_list, output_path):
                     'Rule_Data': rule['rule_data']
                 })
 
-        print(f"✅ Ranking data saved successfully to {ranking_output_path}.")
+        print(f"{green('✅')} {bold('Ranking data saved successfully to')} {ranking_output_path}.")
         return ranking_output_path
     except Exception as e:
-        print(f"❌ Error while saving ranking data to CSV file: {e}")
+        print(f"{red('❌')} {bold('Error while saving ranking data to CSV file:')} {e}")
         return None
 
 def load_and_save_optimized_rules(csv_path, output_path, top_k):
     """Loads ranking data from a CSV, sorts, and saves the Top K rules."""
     if not csv_path:
-        print("\nOptimization skipped: Ranking CSV path is missing.")
+        print(f"{yellow('⚠️')} {bold('Optimization skipped: Ranking CSV path is missing.')}")
         return
 
-    print(f"\nLoading ranking from CSV: {csv_path} and saving Top {top_k} Optimized Rules to: {output_path}...")
+    print(f"{blue('🔧')} {bold('Loading ranking from CSV:')} {csv_path} {bold('and saving Top')} {cyan(f'{top_k}')} {bold('Optimized Rules to:')} {output_path}...")
     
     ranked_data = []
     try:
@@ -251,27 +274,27 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
                 except ValueError:
                     continue
     except FileNotFoundError:
-        print(f"❌ Error: Ranking CSV file not found at: {csv_path}")
+        print(f"{red('❌')} {bold('Error: Ranking CSV file not found at:')} {csv_path}")
         return
     except Exception as e:
-        print(f"❌ Error while reading CSV: {e}")
+        print(f"{red('❌')} {bold('Error while reading CSV:')} {e}")
         return
 
     # FIXED: Include ALL rules from CSV, don't filter by score
-    print(f"📊 Loaded {len(ranked_data):,} total rules from CSV")
+    print(f"{blue('📊')} {bold('Loaded')} {cyan(f'{len(ranked_data):,}')} {bold('total rules from CSV')}")
 
     ranked_data.sort(key=lambda row: row['Combined_Score'], reverse=True)
     
     # FIXED: Cap at available rules if top_k exceeds available count
     available_rules = len(ranked_data)
     if top_k > available_rules:
-        print(f"⚠️  Warning: Requested {top_k:,} rules but only {available_rules:,} available. Saving {available_rules:,} rules.")
+        print(f"{yellow('⚠️')}  {bold('Warning: Requested')} {cyan(f'{top_k:,}')} {bold('rules but only')} {cyan(f'{available_rules:,}')} {bold('available. Saving')} {cyan(f'{available_rules:,}')} {bold('rules.')}")
         final_optimized_list = ranked_data[:available_rules]
     else:
         final_optimized_list = ranked_data[:top_k]
 
     if not final_optimized_list:
-        print("❌ No rules available after sorting/filtering. Optimized rule file not created.")
+        print(f"{red('❌')} {bold('No rules available after sorting/filtering. Optimized rule file not created.')}")
         return
 
     try:
@@ -279,9 +302,9 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
             f.write(":\n")  # Default rule
             for rule in final_optimized_list:
                 f.write(f"{rule['Rule_Data']}\n")
-        print(f"✅ Top {len(final_optimized_list):,} optimized rules saved successfully to {output_path}.")
+        print(f"{green('✅')} {bold('Top')} {cyan(f'{len(final_optimized_list):,}')} {bold('optimized rules saved successfully to')} {output_path}.")
     except Exception as e:
-        print(f"❌ Error while saving optimized rules to file: {e}")
+        print(f"{red('❌')} {bold('Error while saving optimized rules to file:')} {e}")
 
 def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
     """
@@ -296,14 +319,14 @@ def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
     try:
         file_size = os.path.getsize(wordlist_path) / (1024 * 1024)  # Size in MB
         if file_size > 100:
-            print(f"🚀 Loading large wordlist ({file_size:.1f} MB) using optimized memory mapping...")
+            print(f"{green('🚀')} {bold('Loading large wordlist')} ({file_size:.1f} MB) {bold('using optimized memory mapping...')}")
             if file_size > 500:
-                print("💡 This may take a while. Consider using SSD for better performance.")
+                print(f"{yellow('💡')} {bold('This may take a while. Consider using SSD for better performance.')}")
             if file_size > 1000:
-                print("💡 For multi-GB files, loading time depends on your storage speed:")
-                print("   - HDD: 2-5 minutes per GB")
-                print("   - SSD: 30-60 seconds per GB") 
-                print("   - NVMe: 10-20 seconds per GB")
+                print(f"{yellow('💡')} {bold('For multi-GB files, loading time depends on your storage speed:')}")
+                print(f"{yellow('   -')} {bold('HDD: 2-5 minutes per GB')}")
+                print(f"{yellow('   -')} {bold('SSD: 30-60 seconds per GB')}") 
+                print(f"{yellow('   -')} {bold('NVMe: 10-20 seconds per GB')}")
     except OSError:
         file_size = 0
     
@@ -337,7 +360,7 @@ def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
                         if file_size > 100 and words_loaded % 1000000 == 0:
                             elapsed = time() - load_start
                             rate = words_loaded / elapsed
-                            print(f"📥 Loaded {words_loaded:,} words ({elapsed:.1f}s, {rate:,.0f} words/sec)")
+                            print(f"{blue('📥')} {bold('Loaded')} {cyan(f'{words_loaded:,}')} {bold('words')} ({elapsed:.1f}s, {rate:,.0f} words/sec)")
 
         # Yield remaining words
         if current_batch_count > 0:
@@ -347,11 +370,11 @@ def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
         total_load_time = time() - load_start
         if file_size > 100:
             rate = words_loaded / total_load_time
-            print(f"✅ Wordlist loading completed: {words_loaded:,} words in {total_load_time:.2f}s "
+            print(f"{green('✅')} {bold('Wordlist loading completed:')} {cyan(f'{words_loaded:,}')} {bold('words in')} {total_load_time:.2f}s "
                   f"({rate:,.0f} words/sec)")
             
     except Exception as e:
-        print(f"❌ Error reading wordlist: {e}")
+        print(f"{red('❌')} {bold('Error reading wordlist:')} {e}")
         raise
 
 # ====================================================================
@@ -368,7 +391,7 @@ def get_gpu_memory_info(device):
         available_memory = int(total_memory * (1 - VRAM_SAFETY_MARGIN))
         return total_memory, available_memory
     except Exception as e:
-        print(f"Warning: Could not query GPU memory: {e}")
+        print(f"{yellow('⚠️')} {bold('Warning: Could not query GPU memory:')} {e}")
         # Fallback to conservative defaults
         return 8 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024  # 8GB total, 6GB available
 
@@ -376,11 +399,11 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     """
     Calculate optimal parameters with consideration for large rule sets
     """
-    print(f"🔧 Calculating optimal parameters for {available_vram / (1024**3):.1f} GB available VRAM")
-    print(f"📊 Dataset: {total_words:,} words, {total_rules:,} rules, {cracked_hashes_count:,} cracked hashes")
+    print(f"{blue('🔧')} {bold('Calculating optimal parameters for')} {cyan(f'{available_vram / (1024**3):.1f} GB')} {bold('available VRAM')}")
+    print(f"{blue('📊')} {bold('Dataset:')} {cyan(f'{total_words:,}')} {bold('words,')} {cyan(f'{total_rules:,}')} {bold('rules,')} {cyan(f'{cracked_hashes_count:,}')} {bold('cracked hashes')}")
     
     if reduction_factor < 1.0:
-        print(f"📉 Applying memory reduction factor: {reduction_factor:.2f}")
+        print(f"{yellow('📉')} {bold('Applying memory reduction factor:')} {cyan(f'{reduction_factor:.2f}')}")
     
     # Apply reduction factor
     available_vram = int(available_vram * reduction_factor)
@@ -407,10 +430,10 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     # Available memory for hash maps
     available_for_maps = available_vram - base_memory
     if available_for_maps <= 0:
-        print("⚠️  Warning: Limited VRAM, using minimal configuration")
+        print(f"{yellow('⚠️')}  {bold('Warning: Limited VRAM, using minimal configuration')}")
         available_for_maps = available_vram * 0.5
     
-    print(f"📊 Available for hash maps: {available_for_maps / (1024**3):.2f} GB")
+    print(f"{blue('📊')} {bold('Available for hash maps:')} {cyan(f'{available_for_maps / (1024**3):.2f} GB')}")
     
     # Calculate hash map sizes based on dataset size and available memory
     global_bits = DEFAULT_GLOBAL_HASH_MAP_BITS
@@ -462,13 +485,13 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
         # Reduce batch size slightly to accommodate more rules in memory
         optimal_batch_size = max(MIN_BATCH_SIZE, optimal_batch_size // 2)
     
-    print(f"🎯 Optimal configuration:")
-    print(f"   - Batch size: {optimal_batch_size:,} words")
-    print(f"   - Rules per batch: {MAX_RULES_IN_BATCH:,}")
-    print(f"   - Global hash map: {global_bits} bits ({global_map_bytes / (1024**2):.1f} MB)")
-    print(f"   - Cracked hash map: {cracked_bits} bits ({cracked_map_bytes / (1024**2):.1f} MB)")
-    print(f"   - Total map memory: {total_map_memory / (1024**3):.2f} GB")
-    print(f"   - Estimated rule batches: {(total_rules + MAX_RULES_IN_BATCH - 1) // MAX_RULES_IN_BATCH}")
+    print(f"{green('🎯')} {bold('Optimal configuration:')}")
+    print(f"   {blue('-')} {bold('Batch size:')} {cyan(f'{optimal_batch_size:,} words')}")
+    print(f"   {blue('-')} {bold('Rules per batch:')} {cyan(f'{MAX_RULES_IN_BATCH:,}')}")
+    print(f"   {blue('-')} {bold('Global hash map:')} {cyan(f'{global_bits} bits')} ({global_map_bytes / (1024**2):.1f} MB)")
+    print(f"   {blue('-')} {bold('Cracked hash map:')} {cyan(f'{cracked_bits} bits')} ({cracked_map_bytes / (1024**2):.1f} MB)")
+    print(f"   {blue('-')} {bold('Total map memory:')} {cyan(f'{total_map_memory / (1024**3):.2f} GB')}")
+    print(f"   {blue('-')} {bold('Estimated rule batches:')} {cyan(f'{(total_rules + MAX_RULES_IN_BATCH - 1) // MAX_RULES_IN_BATCH}')}")
     
     return optimal_batch_size, global_bits, cracked_bits
 
@@ -533,7 +556,7 @@ def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLO
     
     for retry in range(max_retries + 1):
         try:
-            print(f"🔄 Attempt {retry + 1}/{max_retries + 1} to allocate buffers (reduction: {current_reduction:.2f})")
+            print(f"{blue('🔄')} {bold('Attempt')} {cyan(f'{retry + 1}/{max_retries + 1}')} {bold('to allocate buffers')} (reduction: {current_reduction:.2f})")
             
             for name, spec in buffer_specs.items():
                 flags = spec['flags']
@@ -544,12 +567,12 @@ def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLO
                 else:
                     buffers[name] = cl.Buffer(context, flags, size)
             
-            print(f"✅ Successfully allocated all buffers on attempt {retry + 1}")
+            print(f"{green('✅')} {bold('Successfully allocated all buffers on attempt')} {cyan(f'{retry + 1}')}")
             return buffers
             
         except cl.MemoryError as e:
             if "MEM_OBJECT_ALLOCATION_FAILURE" in str(e) and retry < max_retries:
-                print(f"⚠️  Memory allocation failed, reducing memory usage...")
+                print(f"{yellow('⚠️')}  {bold('Memory allocation failed, reducing memory usage...')}")
                 current_reduction *= MEMORY_REDUCTION_FACTOR
                 # Clean up any partially allocated buffers
                 for buf in buffers.values():
@@ -561,7 +584,7 @@ def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLO
             else:
                 raise e
                 
-    raise cl.MemoryError(f"Failed to allocate buffers after {max_retries} retries")
+    raise cl.MemoryError(f"{red('❌')} {bold('Failed to allocate buffers after')} {cyan(f'{max_retries}')} {bold('retries')}")
 
 # ====================================================================
 # --- KERNEL SOURCE ---
@@ -1139,8 +1162,8 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     
     # Check if we're dealing with a large rule set
     if total_rules > 100000:
-        print(f"🚀 LARGE RULE SET DETECTED: {total_rules:,} rules")
-        print("   Using optimized processing for large rule sets...")
+        print(f"{green('🚀')} {bold('LARGE RULE SET DETECTED:')} {cyan(f'{total_rules:,}')} {bold('rules')}")
+        print(f"   {bold('Using optimized processing for large rule sets...')}")
     
     # Load cracked hashes ONCE for both memory calculation and processing
     cracked_hashes_np = load_cracked_hashes(cracked_list_path, MAX_WORD_LEN)
@@ -1158,33 +1181,33 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
         # Get GPU memory information
         total_vram, available_vram = get_gpu_memory_info(device)
-        print(f"🎮 GPU: {device.name.strip()}")
-        print(f"💾 Total VRAM: {total_vram / (1024**3):.1f} GB")
-        print(f"💾 Available VRAM: {available_vram / (1024**3):.1f} GB")
+        print(f"{green('🎮')} {bold('GPU:')} {cyan(device.name.strip())}")
+        print(f"{blue('💾')} {bold('Total VRAM:')} {cyan(f'{total_vram / (1024**3):.1f} GB')}")
+        print(f"{blue('💾')} {bold('Available VRAM:')} {cyan(f'{available_vram / (1024**3):.1f} GB')}")
         
         # Handle preset parameter specification
         if preset:
             recommendations, recommended_preset = get_recommended_parameters(device, total_words, cracked_hashes_count)
             
             if preset == "recommend":
-                print(f"🎯 Recommended preset: {recommended_preset}")
+                print(f"{green('🎯')} {bold('Recommended preset:')} {cyan(recommended_preset)}")
                 preset = recommended_preset
             
             if preset in recommendations:
                 preset_config = recommendations[preset]
-                print(f"🔧 Using {preset_config['description']}")
+                print(f"{blue('🔧')} {bold('Using')} {cyan(preset_config['description'])}")
                 words_per_gpu_batch = preset_config['batch_size']
                 global_hash_map_bits = preset_config['global_bits']
                 cracked_hash_map_bits = preset_config['cracked_bits']
             else:
-                print(f"❌ Unknown preset: {preset}. Available presets: {list(recommendations.keys())}")
+                print(f"{red('❌')} {bold('Unknown preset:')} {cyan(preset)}. {bold('Available presets:')} {list(recommendations.keys())}")
                 return
         
         # Handle manual parameter specification
         using_manual_params = False
         if words_per_gpu_batch is not None or global_hash_map_bits is not None or cracked_hash_map_bits is not None:
             using_manual_params = True
-            print(f"🔧 Using manually specified parameters:")
+            print(f"{blue('🔧')} {bold('Using manually specified parameters:')}")
             
             # Set defaults for any unspecified manual parameters
             if words_per_gpu_batch is None:
@@ -1194,9 +1217,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             if cracked_hash_map_bits is None:
                 cracked_hash_map_bits = DEFAULT_CRACKED_HASH_MAP_BITS
                 
-            print(f"   - Batch size: {words_per_gpu_batch:,}")
-            print(f"   - Global hash map: {global_hash_map_bits} bits")
-            print(f"   - Cracked hash map: {cracked_hash_map_bits} bits")
+            print(f"   {blue('-')} {bold('Batch size:')} {cyan(f'{words_per_gpu_batch:,}')}")
+            print(f"   {blue('-')} {bold('Global hash map:')} {cyan(f'{global_hash_map_bits} bits')}")
+            print(f"   {blue('-')} {bold('Cracked hash map:')} {cyan(f'{cracked_hash_map_bits} bits')}")
             
             # Validate manual parameters against available VRAM
             global_map_bytes = (1 << (global_hash_map_bits - 5)) * np.uint32().itemsize
@@ -1212,10 +1235,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             total_batch_memory = (word_batch_bytes + hash_batch_bytes) * 2 + rule_batch_bytes + counter_bytes + total_map_memory
             
             if total_batch_memory > available_vram:
-                print(f"⚠️  Warning: Manual parameters exceed available VRAM!")
-                print(f"   Required: {total_batch_memory / (1024**3):.2f} GB")
-                print(f"   Available: {available_vram / (1024**3):.2f} GB")
-                print("   Consider reducing batch size or hash map bits")
+                print(f"{yellow('⚠️')}  {bold('Warning: Manual parameters exceed available VRAM!')}")
+                print(f"   {bold('Required:')} {cyan(f'{total_batch_memory / (1024**3):.2f} GB')}")
+                print(f"   {bold('Available:')} {cyan(f'{available_vram / (1024**3):.2f} GB')}")
+                print(f"   {bold('Consider reducing batch size or hash map bits')}")
         else:
             # Auto-calculate optimal parameters with large rule set consideration
             words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters_large_rules(
@@ -1238,9 +1261,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         kernel_bfs = prg.bfs_kernel
         kernel_init = prg.hash_map_init_kernel
         
-        print(f"✅ OpenCL initialized on device: {device.name.strip()}")
+        print(f"{green('✅')} {bold('OpenCL initialized on device:')} {cyan(device.name.strip())}")
     except Exception as e:
-        print(f"❌ OpenCL initialization or kernel compilation error: {e}")
+        print(f"{red('❌')} {bold('OpenCL initialization or kernel compilation error:')} {e}")
         exit(1)
 
     # 2. DATA LOADING AND PRE-ENCODING
@@ -1249,10 +1272,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
     # 3. HASH MAP INITIALIZATION
     global_hash_map_np = np.zeros(GLOBAL_HASH_MAP_WORDS, dtype=np.uint32)
-    print(f"📝 Global Hash Map initialized: {global_hash_map_np.nbytes / (1024*1024):.2f} MB allocated.")
+    print(f"{blue('📝')} {bold('Global Hash Map initialized:')} {cyan(f'{global_hash_map_np.nbytes / (1024*1024):.2f} MB')} {bold('allocated.')}")
 
     cracked_hash_map_np = np.zeros(CRACKED_HASH_MAP_WORDS, dtype=np.uint32)
-    print(f"📝 Cracked Hash Map initialized: {cracked_hash_map_np.nbytes / (1024*1024):.2f} MB allocated.")
+    print(f"{blue('📝')} {bold('Cracked Hash Map initialized:')} {cyan(f'{cracked_hash_map_np.nbytes / (1024*1024):.2f} MB')} {bold('allocated.')}")
 
     # 4. OPENCL BUFFER SETUP WITH RETRY LOGIC
     mf = cl.mem_flags
@@ -1327,12 +1350,12 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         cracked_temp_g = buffers.get('cracked_temp', None)
         
     except cl.MemoryError as e:
-        print(f"❌ Fatal: Could not allocate GPU memory even after retries: {e}")
-        print("💡 Try reducing batch size or hash map bits, or use a preset:")
+        print(f"{red('❌')} {bold('Fatal: Could not allocate GPU memory even after retries:')} {e}")
+        print(f"{yellow('💡')} {bold('Try reducing batch size or hash map bits, or use a preset:')}")
         recommendations, _ = get_recommended_parameters(device, total_words, cracked_hashes_count)
         for preset_name, config in recommendations.items():
             if preset_name != "auto":
-                print(f"   --preset {preset_name}: {config['description']}")
+                print(f"   {bold('--preset')} {cyan(preset_name)}: {config['description']}")
         return
 
     current_word_buffer_idx = 0
@@ -1343,22 +1366,22 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         global_size_init_cracked = (int(math.ceil(cracked_hashes_np.size / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
         local_size_init_cracked = (LOCAL_WORK_SIZE,)
 
-        print("Populating static Cracked Hash Map on GPU...")
+        print(f"{blue('📊')} {bold('Populating static Cracked Hash Map on GPU...')}")
         kernel_init(queue, global_size_init_cracked, local_size_init_cracked,
                     cracked_hash_map_g,
                     cracked_temp_g,
                     np.uint32(cracked_hashes_np.size),
                     np.uint32(CRACKED_HASH_MAP_MASK)).wait()
-        print("Static Cracked Hash Map populated.")
+        print(f"{green('✅')} {bold('Static Cracked Hash Map populated.')}")
     else:
-        print("Cracked list is empty, effectiveness scoring is disabled.")
+        print(f"{yellow('⚠️')} {bold('Cracked list is empty, effectiveness scoring is disabled.')}")
         
     # 6. PIPELINED RANKING LOOP SETUP
     word_iterator = wordlist_iterator_optimized(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
     
-    print(f"📊 Processing {total_rules:,} rules in {len(rule_batch_starts):,} batches "
-          f"(up to {MAX_RULES_IN_BATCH:,} rules per batch)")
+    print(f"{blue('📊')} {bold('Processing')} {cyan(f'{total_rules:,}')} {bold('rules in')} {cyan(f'{len(rule_batch_starts):,}')} {bold('batches')} "
+          f"{bold('(up to')} {cyan(f'{MAX_RULES_IN_BATCH:,}')} {bold('rules per batch)')}")
     
     # Use numpy arrays for counters to avoid overflow
     words_processed_total = np.uint64(0)
@@ -1379,7 +1402,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch)
         cl.enqueue_copy(queue, base_hashes_g[current_word_buffer_idx], base_hashes_np_batch).wait()
     except StopIteration:
-        print("Wordlist is empty or too small.")
+        print(f"{yellow('⚠️')} {bold('Wordlist is empty or too small.')}")
         word_batch_pbar.close()
         rule_batch_pbar.close()
         return
@@ -1465,13 +1488,15 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     end_time = time()
     
     # 10. FINAL REPORTING AND SAVING
-    print("\n--- Final Results Summary ---")
-    print(f"Total Words Processed: {int(words_processed_total):,}")
-    print(f"Total Rules Processed: {total_rules:,}")
-    print(f"Total Unique Words Generated: {int(total_unique_found):,}")
-    print(f"Total True Cracks Found: {int(total_cracked_found):,}")
-    print(f"Total Execution Time: {end_time - start_time:.2f} seconds")
-    print("-----------------------------\n")
+    print(f"\n{green('=' * 60)}")
+    print(f"{bold('🎉 Final Results Summary')}")
+    print(f"{green('=' * 60)}")
+    print(f"{blue('📊')} {bold('Total Words Processed:')} {cyan(f'{int(words_processed_total):,}')}")
+    print(f"{blue('📊')} {bold('Total Rules Processed:')} {cyan(f'{total_rules:,}')}")
+    print(f"{blue('🎯')} {bold('Total Unique Words Generated:')} {cyan(f'{int(total_unique_found):,}')}")
+    print(f"{blue('🔓')} {bold('Total True Cracks Found:')} {cyan(f'{int(total_cracked_found):,}')}")
+    print(f"{blue('⏱️')}  {bold('Total Execution Time:')} {cyan(f'{end_time - start_time:.2f} seconds')}")
+    print(f"{green('=' * 60)}{Colors.END}\n")
 
     csv_path = save_ranking_data(rules_list, ranking_output_path)
     if top_k > 0:
@@ -1504,89 +1529,9 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
-    print("=" * 70)
-    print("* RANKER v3.1 - FIXED VERSION")
-    print("* FIXED: Now saves ALL rules as requested by -k parameter")
-    print("* FIXED: Removed filtering that excluded zero-score rules")
-    print("* IMPROVED: MAX_RULES_IN_BATCH increased to 1024")
-    print("* ENHANCED: Better memory management for large rule sets")
-    print("* ENHANCED: Improved timing information for large wordlists")
-    print("=" * 70)
-
-    rank_rules_uniqueness_large(
-        wordlist_path=args.wordlist,
-        rules_path=args.rules,
-        cracked_list_path=args.cracked,
-        ranking_output_path=args.output,
-        top_k=args.topk,
-        words_per_gpu_batch=args.batch_size,
-        global_hash_map_bits=args.global_bits,
-        cracked_hash_map_bits=args.cracked_bits,
-        preset=args.preset
-    )
-
-        # 9. UPDATE AND PREPARE NEXT ITERATION
-        words_processed_total += np.uint64(num_words_batch_exec)
-        word_batch_pbar.update(num_words_batch_exec)
-        word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {int(total_unique_found):,} | Cracked: {int(total_cracked_found):,}]")
-
-        if next_batch_data is None:
-            break
-            
-        current_word_buffer_idx = next_idx
-        num_words_batch_exec = num_words_batch_next
-
-    word_batch_pbar.close()
-    rule_batch_pbar.close()
-    end_time = time()
-    
-    # 10. FINAL REPORTING AND SAVING
-    print("\n--- Final Results Summary ---")
-    print(f"Total Words Processed: {int(words_processed_total):,}")
-    print(f"Total Rules Processed: {total_rules:,}")
-    print(f"Total Unique Words Generated: {int(total_unique_found):,}")
-    print(f"Total True Cracks Found: {int(total_cracked_found):,}")
-    print(f"Total Execution Time: {end_time - start_time:.2f} seconds")
-    print("-----------------------------\n")
-
-    csv_path = save_ranking_data(rules_list, ranking_output_path)
-    if top_k > 0:
-        optimized_output_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
-        load_and_save_optimized_rules(csv_path, optimized_output_path, top_k)
-
-# ====================================================================
-# --- MAIN EXECUTION ---
-# ====================================================================
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.1 - Large Rule Support)")
-    parser.add_argument('-w', '--wordlist', required=True, help='Path to the base wordlist file.')
-    parser.add_argument('-r', '--rules', required=True, help='Path to the Hashcat rules file to rank.')
-    parser.add_argument('-c', '--cracked', required=True, help='Path to a list of cracked passwords for effectiveness scoring.')
-    parser.add_argument('-o', '--output', default='ranker_output.csv', help='Path to save the final ranking CSV.')
-    parser.add_argument('-k', '--topk', type=int, default=1000, help='Number of top rules to save to an optimized .rule file. Set to 0 to skip.')
-    
-    # Performance tuning flags
-    parser.add_argument('--batch-size', type=int, default=None, 
-                       help=f'Number of words to process in each GPU batch (default: auto-calculate based on VRAM)')
-    parser.add_argument('--global-bits', type=int, default=None,
-                       help=f'Bits for global hash map size (default: auto-calculate based on VRAM)')
-    parser.add_argument('--cracked-bits', type=int, default=None,
-                       help=f'Bits for cracked hash map size (default: auto-calculate based on VRAM)')
-    
-    # New preset argument for easy configuration
-    parser.add_argument('--preset', type=str, default=None,
-                       help='Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)')
-    
-    args = parser.parse_args()
-
-    print("=" * 70)
-    print("* RANKER v3.1 - FIXED VERSION")
-    print("* FIXED: Now saves ALL rules as requested by -k parameter")
-    print("* FIXED: Removed filtering that excluded zero-score rules")
-    print("* IMPROVED: MAX_RULES_IN_BATCH increased to 1024")
-    print("* ENHANCED: Better memory management for large rule sets")
-    print("=" * 70)
+    print(f"{green('=' * 70)}")
+    print(f"{bold('🎯 RANKER v3.1 - COLORIZED VERSION')}")
+    print(f"{green('=' * 70)}{Colors.END}")
 
     rank_rules_uniqueness_large(
         wordlist_path=args.wordlist,
