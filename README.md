@@ -53,12 +53,14 @@ Clone the Repository (or save the script):
 
 🚀 **Usage**
 
-The script is executed via the command line and requires five primary arguments:
+The script is executed via the command line and requires five primary arguments and four optional:
 
 ```
-usage: ranker.py [-h] -w WORDLIST -r RULES -c CRACKED [-o OUTPUT] [-k TOPK]
+python3 ranker.py -h
+usage: ranker.py [-h] -w WORDLIST -r RULES -c CRACKED [-o OUTPUT] [-k TOPK] [--batch-size BATCH_SIZE] [--global-bits GLOBAL_BITS]
+                 [--cracked-bits CRACKED_BITS] [--preset PRESET]
 
-GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v2.8)
+GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.1 - Large Rule Support)
 
 options:
   -h, --help            show this help message and exit
@@ -71,6 +73,14 @@ options:
   -o OUTPUT, --output OUTPUT
                         Path to save the final ranking CSV.
   -k TOPK, --topk TOPK  Number of top rules to save to an optimized .rule file. Set to 0 to skip.
+  --batch-size BATCH_SIZE
+                        Number of words to process in each GPU batch (default: auto-calculate based on VRAM)
+  --global-bits GLOBAL_BITS
+                        Bits for global hash map size (default: auto-calculate based on VRAM)
+  --cracked-bits CRACKED_BITS
+                        Bits for cracked hash map size (default: auto-calculate based on VRAM)
+  --preset PRESET       Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)
+
 ```
 📊 **Output**
 
