@@ -8,6 +8,8 @@ import warnings
 import os
 from time import time
 import mmap
+import signal
+import sys
 
 # ====================================================================
 # --- RANKER v3.1: IMPROVED CAPACITY FOR LARGE RULE SETS ---
@@ -69,6 +71,15 @@ MIN_HASH_MAP_BITS = 28     # Minimum hash map size (256MB)
 MEMORY_REDUCTION_FACTOR = 0.7  # Reduce memory by 30% on each retry
 MAX_ALLOCATION_RETRIES = 5     # Maximum retries for memory allocation
 
+# Global variables for interrupt handling
+interrupted = False
+current_rules_list = None
+current_ranking_output_path = None
+current_top_k = 0
+words_processed_total = None
+total_unique_found = None
+total_cracked_found = None
+
 # Rule IDs (updated for larger capacity)
 START_ID_SIMPLE = 0
 NUM_SIMPLE_RULES = 10
@@ -82,6 +93,119 @@ START_ID_GROUPB = START_ID_A + NUM_A_RULES
 NUM_GROUPB_RULES = 13
 START_ID_NEW = START_ID_GROUPB + NUM_GROUPB_RULES
 NUM_NEW_RULES = 13
+
+# ====================================================================
+# --- INTERRUPT HANDLER FUNCTIONS ---
+# ====================================================================
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C interrupt signal"""
+    global interrupted, current_rules_list, current_ranking_output_path, current_top_k
+    global words_processed_total, total_unique_found, total_cracked_found
+    
+    print(f"\n{yellow('⚠️')} {bold('Interrupt received!')}")
+    
+    if interrupted:
+        print(f"{red('❌')} {bold('Forced exit!')}")
+        sys.exit(1)
+        
+    interrupted = True
+    
+    if current_rules_list is not None and current_ranking_output_path is not None:
+        print(f"{blue('💾')} {bold('Saving current progress...')}")
+        save_current_progress()
+    else:
+        print(f"{yellow('⚠️')} {bold('No data to save. Exiting...')}")
+        sys.exit(1)
+
+def save_current_progress():
+    """Save current progress when interrupted"""
+    global current_rules_list, current_ranking_output_path, current_top_k
+    global words_processed_total, total_unique_found, total_cracked_found
+    
+    try:
+        # Create intermediate output path
+        base_path = os.path.splitext(current_ranking_output_path)[0]
+        intermediate_output_path = f"{base_path}_INTERRUPTED.csv"
+        intermediate_optimized_path = f"{base_path}_INTERRUPTED.rule"
+        
+        # Save current ranking data
+        if current_rules_list:
+            print(f"{blue('💾')} {bold('Saving intermediate results to:')} {intermediate_output_path}")
+            
+            # Calculate combined score for current progress
+            for rule in current_rules_list:
+                rule['combined_score'] = rule.get('effectiveness_score', 0) * 10 + rule.get('uniqueness_score', 0)
+            
+            # Save all rules regardless of score
+            ranked_rules = current_rules_list
+            ranked_rules.sort(key=lambda rule: rule['combined_score'], reverse=True)
+            
+            with open(intermediate_output_path, 'w', newline='', encoding='utf-8') as f:
+                fieldnames = ['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 'Rule_Data']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for rank, rule in enumerate(ranked_rules, 1):
+                    writer.writerow({
+                        'Rank': rank,
+                        'Combined_Score': rule['combined_score'],
+                        'Effectiveness_Score': rule.get('effectiveness_score', 0),
+                        'Uniqueness_Score': rule.get('uniqueness_score', 0),
+                        'Rule_Data': rule['rule_data']
+                    })
+            
+            print(f"{green('✅')} {bold('Intermediate ranking data saved:')} {cyan(f'{len(ranked_rules):,}')} {bold('rules')}")
+            
+            # Save optimized rules if requested
+            if current_top_k > 0:
+                print(f"{blue('💾')} {bold('Saving intermediate optimized rules to:')} {intermediate_optimized_path}")
+                
+                available_rules = len(ranked_rules)
+                final_count = min(current_top_k, available_rules)
+                
+                with open(intermediate_optimized_path, 'w', newline='\n', encoding='utf-8') as f:
+                    f.write(":\n")  # Default rule
+                    for rule in ranked_rules[:final_count]:
+                        f.write(f"{rule['rule_data']}\n")
+                
+                print(f"{green('✅')} {bold('Intermediate optimized rules saved:')} {cyan(f'{final_count:,}')} {bold('rules')}")
+        
+        # Print progress summary
+        if words_processed_total is not None:
+            print(f"\n{green('=' * 60)}")
+            print(f"{bold('📊 Progress Summary at Interruption')}")
+            print(f"{green('=' * 60)}")
+            print(f"{blue('📊')} {bold('Words Processed:')} {cyan(f'{int(words_processed_total):,}')}")
+            if total_unique_found is not None:
+                print(f"{blue('🎯')} {bold('Unique Words Generated:')} {cyan(f'{int(total_unique_found):,}')}")
+            if total_cracked_found is not None:
+                print(f"{blue('🔓')} {bold('True Cracks Found:')} {cyan(f'{int(total_cracked_found):,}')}")
+            print(f"{green('=' * 60)}{Colors.END}\n")
+            
+        print(f"{green('✅')} {bold('Progress saved successfully. You can resume later using the intermediate files.')}")
+        
+    except Exception as e:
+        print(f"{red('❌')} {bold('Error saving intermediate progress:')} {e}")
+    
+    sys.exit(0)
+
+def setup_interrupt_handler(rules_list, ranking_output_path, top_k):
+    """Setup interrupt handler with current context"""
+    global current_rules_list, current_ranking_output_path, current_top_k
+    current_rules_list = rules_list
+    current_ranking_output_path = ranking_output_path
+    current_top_k = top_k
+    
+    # Setup signal handler for Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+
+def update_progress_stats(words_processed, unique_found, cracked_found):
+    """Update progress statistics for interrupt handler"""
+    global words_processed_total, total_unique_found, total_cracked_found
+    words_processed_total = words_processed
+    total_unique_found = unique_found
+    total_cracked_found = cracked_found
 
 # ====================================================================
 # --- MISSING HELPER FUNCTIONS ---
@@ -1160,6 +1284,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     rules_list = load_rules(rules_path)
     total_rules = len(rules_list)
     
+    # Setup interrupt handler BEFORE starting processing
+    setup_interrupt_handler(rules_list, ranking_output_path, top_k)
+    
     # Check if we're dealing with a large rule set
     if total_rules > 100000:
         print(f"{green('🚀')} {bold('LARGE RULE SET DETECTED:')} {cyan(f'{total_rules:,}')} {bold('rules')}")
@@ -1409,6 +1536,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
     # B. Main Pipelined Loop
     while True:
+        # Check for interrupt before processing
+        if interrupted:
+            break
+            
         exec_idx = current_word_buffer_idx
         next_idx = 1 - current_word_buffer_idx
         
@@ -1425,6 +1556,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         
         # 8. PROCESS RULE BATCHES
         for rule_batch_idx, rule_start_index in enumerate(rule_batch_starts):
+            # Check for interrupt during rule batch processing
+            if interrupted:
+                break
+                
             rule_end_index = min(rule_start_index + MAX_RULES_IN_BATCH, total_rules)
             num_rules_in_batch = rule_end_index - rule_start_index
 
@@ -1472,6 +1607,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
             rule_batch_pbar.update(1)
 
+        # Update progress stats for interrupt handler
+        update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
+            
         # 9. UPDATE AND PREPARE NEXT ITERATION
         words_processed_total += np.uint64(num_words_batch_exec)
         word_batch_pbar.update(num_words_batch_exec)
@@ -1485,6 +1623,12 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
     word_batch_pbar.close()
     rule_batch_pbar.close()
+    
+    # Check if we were interrupted
+    if interrupted:
+        print(f"\n{yellow('⚠️')} {bold('Processing was interrupted. Intermediate results have been saved.')}")
+        return
+        
     end_time = time()
     
     # 10. FINAL REPORTING AND SAVING
@@ -1530,7 +1674,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print(f"{green('=' * 70)}")
-    print(f"{bold('🎯 RANKER v3.1 - COLORIZED VERSION')}")
+    print(f"{bold('🎯 RANKER v3.1')}")
     print(f"{green('=' * 70)}{Colors.END}")
 
     rank_rules_uniqueness_large(
@@ -1544,3 +1688,4 @@ if __name__ == '__main__':
         cracked_hash_map_bits=args.cracked_bits,
         preset=args.preset
     )
+
