@@ -1319,7 +1319,7 @@ void bfs_kernel(
 """
 
 # ====================================================================
-# --- UPDATED MAIN RANKING FUNCTION WITH OPTIMIZED LOADING ---
+# --- UPDATED MAIN RANKING FUNCTION WITH CONTINUOUS RULE PROCESSING ---
 # ====================================================================
 
 def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
@@ -1584,6 +1584,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         return
 
     # B. Main Pipelined Loop
+    wordlist_processing_complete = False
+    remaining_rule_batches = rule_batch_starts.copy()
+    
     while True:
         # Check for interrupt before processing
         if interrupted:
@@ -1592,19 +1595,22 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         exec_idx = current_word_buffer_idx
         next_idx = 1 - current_word_buffer_idx
         
-        # 7. ASYNC COPY: Start load of the *next* batch
+        # 7. ASYNC COPY: Start load of the *next* batch (only if wordlist processing not complete)
         next_batch_data = None
-        try:
-            next_batch_data = next(word_iterator)
-            base_words_np_next, base_hashes_np_next, num_words_batch_next = next_batch_data
-            copy_events[next_idx] = cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next)
-            cl.enqueue_copy(queue, base_hashes_g[next_idx], base_hashes_np_next, wait_for=[copy_events[next_idx]])
-        except StopIteration:
-            next_batch_data = None
-            copy_events[next_idx] = None
+        if not wordlist_processing_complete:
+            try:
+                next_batch_data = next(word_iterator)
+                base_words_np_next, base_hashes_np_next, num_words_batch_next = next_batch_data
+                copy_events[next_idx] = cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next)
+                cl.enqueue_copy(queue, base_hashes_g[next_idx], base_hashes_np_next, wait_for=[copy_events[next_idx]])
+            except StopIteration:
+                wordlist_processing_complete = True
+                print(f"{green('✅')} {bold('Wordlist fully loaded. Continuing with remaining rule batches...')}")
+                next_batch_data = None
+                copy_events[next_idx] = None
         
-        # 8. PROCESS RULE BATCHES
-        for rule_batch_idx, rule_start_index in enumerate(rule_batch_starts):
+        # 8. PROCESS RULE BATCHES (process all remaining rule batches with current word batch)
+        for rule_batch_idx, rule_start_index in enumerate(remaining_rule_batches):
             # Check for interrupt during rule batch processing
             if interrupted:
                 break
@@ -1656,6 +1662,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
             rule_batch_pbar.update(1)
 
+        # Remove processed rule batches from the list
+        remaining_rule_batches = []
+
         # Update progress stats for interrupt handler
         update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
             
@@ -1664,11 +1673,22 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         word_batch_pbar.update(num_words_batch_exec)
         word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {int(total_unique_found):,} | Cracked: {int(total_cracked_found):,}]")
 
-        if next_batch_data is None:
+        # Check if we're done (both wordlist and all rule batches processed)
+        if wordlist_processing_complete and not remaining_rule_batches:
             break
             
-        current_word_buffer_idx = next_idx
-        num_words_batch_exec = num_words_batch_next
+        # Move to next word batch if available
+        if next_batch_data is not None:
+            current_word_buffer_idx = next_idx
+            num_words_batch_exec = num_words_batch_next
+        elif wordlist_processing_complete:
+            # If wordlist is done but we still have rule batches, we need to reset to process remaining rules
+            # with the current word batch (this handles the case where we have more rule batches than word batches)
+            if remaining_rule_batches:
+                print(f"{blue('🔄')} {bold('Reusing current word batch for remaining rule processing...')}")
+                continue
+            else:
+                break
 
     word_batch_pbar.close()
     rule_batch_pbar.close()
