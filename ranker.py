@@ -144,10 +144,6 @@ def fast_fnv1a_hash_32(data):
             hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
         return hash_val
 
-def bulk_hash_words(words_list):
-    """Compute hashes for multiple words in bulk"""
-    return [fast_fnv1a_hash_32(word) for word in words_list]
-
 def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     """
     Massively optimized wordlist loader using memory mapping and bulk processing
@@ -159,7 +155,6 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     
     batch_elements = batch_size * max_len
     words_buffer = np.zeros(batch_elements, dtype=np.uint8)
-    hashes_buffer = np.zeros(batch_size, dtype=np.uint32)
     
     load_start = time()
     total_words_loaded = 0
@@ -171,8 +166,8 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
                 batch_count = 0
                 file_size = len(mm)
                 
-                # Use a progress bar that updates based on file position
-                with tqdm(total=file_size, desc="Loading wordlist", unit="B", unit_scale=True) as pbar:
+                # Use a progress bar for loading progress
+                with tqdm(total=file_size, desc="Loading wordlist", unit="B", unit_scale=True, leave=False) as pbar:
                     while pos < file_size and not interrupted:
                         # Find next newline efficiently
                         end_pos = mm.find(b'\n', pos)
@@ -196,21 +191,18 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
                         # Use memoryview for efficient copying
                         words_buffer[start_idx:end_idx] = np.frombuffer(line, dtype=np.uint8, count=line_len)
                         
-                        # Compute hash
-                        hashes_buffer[batch_count] = fast_fnv1a_hash_32(line)
                         batch_count += 1
                         total_words_loaded += 1
                         
                         # Yield batch when full
                         if batch_count >= batch_size:
-                            yield words_buffer.copy(), hashes_buffer.copy(), batch_count
+                            yield words_buffer, batch_count
                             batch_count = 0
                             words_buffer.fill(0)
-                            hashes_buffer.fill(0)
                 
                 # Yield final partial batch
                 if batch_count > 0 and not interrupted:
-                    yield words_buffer, hashes_buffer, batch_count
+                    yield words_buffer, batch_count
                     
     except Exception as e:
         print(f"{red('❌')} {bold('Error in optimized loader:')} {e}")
@@ -219,27 +211,6 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     load_time = time() - load_start
     print(f"{green('✅')} {bold('Optimized loading completed:')} {cyan(f'{total_words_loaded:,}')} {bold('words in')} {load_time:.2f}s "
           f"({total_words_loaded/load_time:,.0f} words/sec)")
-
-def parallel_hash_computation(words_batch, max_len, batch_count):
-    """Compute hashes in parallel using multiple threads"""
-    hashes = np.zeros(batch_count, dtype=np.uint32)
-    
-    def compute_hash(i):
-        start = i * max_len
-        end = start + max_len
-        word_data = words_batch[start:end]
-        # Find actual length (first zero byte)
-        actual_len = np.argmax(word_data == 0)
-        if actual_len == 0:
-            actual_len = max_len
-        return fast_fnv1a_hash_32(word_data[:actual_len])
-    
-    # Use ThreadPoolExecutor for parallel hash computation
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        results = list(executor.map(compute_hash, range(batch_count)))
-    
-    hashes[:] = results
-    return hashes
 
 # ====================================================================
 # --- INTERRUPT HANDLER FUNCTIONS ---
@@ -582,14 +553,15 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     
     # Memory requirements per component (in bytes)
     word_batch_bytes = MAX_WORD_LEN * np.uint8().itemsize
-    hash_batch_bytes = np.uint32().itemsize
     rule_batch_bytes = MAX_RULES_IN_BATCH * (2 + MAX_RULE_ARGS) * np.uint32().itemsize
     counter_bytes = MAX_RULES_IN_BATCH * np.uint32().itemsize * 2
     
     # Base memory needed (excluding hash maps)
+    # Note: Rule memory is now mostly outside the word batch loop's consideration
+    # We estimate the rule buffers upfront instead.
     base_memory = (
-        (word_batch_bytes + hash_batch_bytes) * 2 +  # Double buffering
-        rule_batch_bytes + counter_bytes
+        (word_batch_bytes) + 
+        counter_bytes * 2 
     )
     
     # Adjust batch size based on rule count to avoid too many iterations
@@ -599,8 +571,11 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     else:
         suggested_batch_size = DEFAULT_WORDS_PER_GPU_BATCH
     
-    # Available memory for hash maps
-    available_for_maps = available_vram - base_memory
+    # Available memory for hash maps and all rule buffers
+    rule_buffer_count = math.ceil(total_rules / MAX_RULES_IN_BATCH)
+    total_rule_buffer_bytes = rule_buffer_count * rule_batch_bytes
+    
+    available_for_maps = available_vram - base_memory - total_rule_buffer_bytes
     if available_for_maps <= 0:
         print(f"{yellow('⚠️')}  {bold('Warning: Limited VRAM, using minimal configuration')}")
         available_for_maps = available_vram * 0.5
@@ -640,12 +615,13 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     # Calculate optimal batch size considering rule count
     memory_per_word = (
         word_batch_bytes +  # base words
-        hash_batch_bytes +  # base hashes
-        (MAX_OUTPUT_LEN * np.uint8().itemsize) +  # result temp
-        (rule_batch_bytes / MAX_RULES_IN_BATCH)  # rule memory per word
+        (MAX_OUTPUT_LEN * np.uint8().itemsize)   # result temp (local memory)
     )
     
-    max_batch_by_memory = int((available_vram - total_map_memory - base_memory) / memory_per_word)
+    # Max batch size calculation is more complex now due to multiple kernel runs in inner loop
+    # For simplicity, we stick to the original estimation logic, prioritizing a single pass.
+    # The VRAM cost of the global/cracked maps + all rule buffers is the primary limit.
+    max_batch_by_memory = int((available_vram - total_map_memory - total_rule_buffer_bytes - base_memory) / memory_per_word)
     optimal_batch_size = min(suggested_batch_size, max_batch_by_memory)
     optimal_batch_size = max(MIN_BATCH_SIZE, optimal_batch_size)
     
@@ -663,11 +639,11 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     print(f"   {blue('-')} {bold('Global hash map:')} {cyan(f'{global_bits} bits')} ({global_map_bytes / (1024**2):.1f} MB)")
     print(f"   {blue('-')} {bold('Cracked hash map:')} {cyan(f'{cracked_bits} bits')} ({cracked_map_bytes / (1024**2):.1f} MB)")
     print(f"   {blue('-')} {bold('Total map memory:')} {cyan(f'{total_map_memory / (1024**3):.2f} GB')}")
-    print(f"   {blue('-')} {bold('Estimated rule batches:')} {cyan(f'{(total_rules + MAX_RULES_IN_BATCH - 1) // MAX_RULES_IN_BATCH}')}")
+    print(f"   {blue('-')} {bold('Total rule buffer memory:')} {cyan(f'{total_rule_buffer_bytes / (1024**3):.2f} GB')}")
     
     return optimal_batch_size, global_bits, cracked_bits
 
-def get_recommended_parameters(device, total_words, cracked_hashes_count):
+def get_recommended_parameters(device, total_words, cracked_hashes_count, total_rules):
     """
     Get recommended parameter values based on GPU capabilities and dataset size
     """
@@ -710,7 +686,7 @@ def get_recommended_parameters(device, total_words, cracked_hashes_count):
     
     # Calculate auto parameters
     auto_batch, auto_global, auto_cracked = calculate_optimal_parameters_large_rules(
-        available_vram, total_words, cracked_hashes_count, total_words
+        available_vram, total_words, cracked_hashes_count, total_rules
     )
     recommendations["auto"]["batch_size"] = auto_batch
     recommendations["auto"]["global_bits"] = auto_global
@@ -1286,7 +1262,6 @@ void bfs_kernel(
                 }}
                 capitalize_next = (result_temp[i] == ' ');
             }}
-            // REMOVED THE EXTRA BREAK STATEMENT THAT WAS CAUSING THE ERROR
         }}
     }}
 
@@ -1362,7 +1337,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         
         # Handle preset parameter specification
         if preset:
-            recommendations, recommended_preset = get_recommended_parameters(device, total_words, cracked_hashes_count)
+            recommendations, recommended_preset = get_recommended_parameters(device, total_words, cracked_hashes_count, total_rules)
             
             if preset == "recommend":
                 print(f"{green('🎯')} {bold('Recommended preset:')} {cyan(recommended_preset)}")
@@ -1403,11 +1378,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             
             # Memory requirements for batch processing
             word_batch_bytes = words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
-            hash_batch_bytes = words_per_gpu_batch * np.uint32().itemsize
             rule_batch_bytes = MAX_RULES_IN_BATCH * (2 + MAX_RULE_ARGS) * np.uint32().itemsize
             counter_bytes = MAX_RULES_IN_BATCH * np.uint32().itemsize * 2
             
-            total_batch_memory = (word_batch_bytes + hash_batch_bytes) * 2 + rule_batch_bytes + counter_bytes + total_map_memory
+            total_batch_memory = word_batch_bytes + rule_batch_bytes + counter_bytes + total_map_memory
             
             if total_batch_memory > available_vram:
                 print(f"{yellow('⚠️')}  {bold('Warning: Manual parameters exceed available VRAM!')}")
@@ -1460,7 +1434,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
     # Define buffer specifications for retry logic
     buffer_specs = {
-        # Double buffering for words and hashes
+        # Double buffering for words
         'base_words_in_0': {
             'flags': mf.READ_ONLY,
             'size': words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
@@ -1468,14 +1442,6 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         'base_words_in_1': {
             'flags': mf.READ_ONLY,
             'size': words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
-        },
-        'base_hashes_0': {
-            'flags': mf.READ_ONLY,
-            'size': words_per_gpu_batch * np.uint32().itemsize
-        },
-        'base_hashes_1': {
-            'flags': mf.READ_ONLY,
-            'size': words_per_gpu_batch * np.uint32().itemsize
         },
         # Rule input buffer (INCREASED CAPACITY)
         'rules_in': {
@@ -1516,7 +1482,6 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         
         # Extract buffers for easier access
         base_words_in_g = [buffers['base_words_in_0'], buffers['base_words_in_1']]
-        base_hashes_g = [buffers['base_hashes_0'], buffers['base_hashes_1']]
         rules_in_g = buffers['rules_in']
         global_hash_map_g = buffers['global_hash_map']
         cracked_hash_map_g = buffers['cracked_hash_map']
@@ -1527,14 +1492,13 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     except cl.MemoryError as e:
         print(f"{red('❌')} {bold('Fatal: Could not allocate GPU memory even after retries:')} {e}")
         print(f"{yellow('💡')} {bold('Try reducing batch size or hash map bits, or use a preset:')}")
-        recommendations, _ = get_recommended_parameters(device, total_words, cracked_hashes_count)
+        recommendations, _ = get_recommended_parameters(device, total_words, cracked_hashes_count, total_rules)
         for preset_name, config in recommendations.items():
             if preset_name != "auto":
                 print(f"   {bold('--preset')} {cyan(preset_name)}: {config['description']}")
         return
 
     current_word_buffer_idx = 0
-    copy_events = [None, None]
 
     # 5. INITIALIZE CRACKED HASH MAP (ONCE)
     if cracked_hashes_np.size > 0 and cracked_temp_g is not None:
@@ -1552,7 +1516,6 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         print(f"{yellow('⚠️')} {bold('Cracked list is empty, effectiveness scoring is disabled.')}")
         
     # 6. PIPELINED RANKING LOOP SETUP
-    # USE OPTIMIZED LOADER INSTEAD OF OLD ONE
     word_iterator = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
     
@@ -1570,64 +1533,57 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     num_words_batch_exec = 0
     
     word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist from disk [Unique: 0 | Cracked: 0]", unit=" word")
-    rule_batch_pbar = tqdm(total=len(rule_batch_starts), desc="Rule batches processed", unit=" batch")
+    rule_batch_pbar = tqdm(total=len(rule_batch_starts), desc="Rule batches processed", unit=" batch", leave=False)
 
-    # A. Initial word batch load
+    # A. Get initial word batch
     try:
-        base_words_np_batch, base_hashes_np_batch, num_words_batch_exec = next(word_iterator)
-        cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch)
-        cl.enqueue_copy(queue, base_hashes_g[current_word_buffer_idx], base_hashes_np_batch).wait()
+        base_words_np_batch, num_words_batch_exec = next(word_iterator)
+        # Copy initial batch to GPU
+        cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch).wait()
     except StopIteration:
         print(f"{yellow('⚠️')} {bold('Wordlist is empty or too small.')}")
         word_batch_pbar.close()
         rule_batch_pbar.close()
         return
 
-    # B. Main Pipelined Loop
+    # B. Main Processing Loop
     wordlist_processing_complete = False
-    remaining_rule_batches = rule_batch_starts.copy()
+    next_batch_available = True
+    next_batch_data = None
+    next_batch_loaded = False
     
+    # Process all word batches
     while True:
         # Check for interrupt before processing
         if interrupted:
             break
             
         exec_idx = current_word_buffer_idx
-        next_idx = 1 - current_word_buffer_idx
         
-        # 7. ASYNC COPY: Start load of the *next* batch (only if wordlist processing not complete)
-        next_batch_data = None
-        if not wordlist_processing_complete:
-            try:
-                next_batch_data = next(word_iterator)
-                base_words_np_next, base_hashes_np_next, num_words_batch_next = next_batch_data
-                copy_events[next_idx] = cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next)
-                cl.enqueue_copy(queue, base_hashes_g[next_idx], base_hashes_np_next, wait_for=[copy_events[next_idx]])
-            except StopIteration:
-                wordlist_processing_complete = True
-                print(f"{green('✅')} {bold('Wordlist fully loaded. Continuing with remaining rule batches...')}")
-                next_batch_data = None
-                copy_events[next_idx] = None
-        
-        # 8. PROCESS RULE BATCHES (process all remaining rule batches with current word batch)
-        for rule_batch_idx, rule_start_index in enumerate(remaining_rule_batches):
-            # Check for interrupt during rule batch processing
+        # 7. PROCESS ALL RULE BATCHES FOR CURRENT WORD BATCH
+        for rule_batch_idx, rule_start_index in enumerate(rule_batch_starts):
             if interrupted:
                 break
                 
             rule_end_index = min(rule_start_index + MAX_RULES_IN_BATCH, total_rules)
             num_rules_in_batch = rule_end_index - rule_start_index
 
+            # Prepare rule batch
             current_rule_batch_list = encoded_rules[rule_start_index:rule_end_index]
             current_rules_np = np.concatenate(current_rule_batch_list)
             
+            # Copy rule batch to GPU
             cl.enqueue_copy(queue, rules_in_g, current_rules_np, is_blocking=True)
+            
+            # Reset counters
             cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size)
             cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size)
             
+            # Calculate kernel execution size
             global_size = (num_words_batch_exec * num_rules_in_batch, )
             global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
 
+            # Set kernel arguments
             kernel_bfs.set_args(
                 base_words_in_g[exec_idx],
                 rules_in_g,
@@ -1643,12 +1599,15 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 np.uint32(CRACKED_HASH_MAP_MASK)
             )
 
+            # Execute kernel
             exec_event = cl.enqueue_nd_range_kernel(queue, kernel_bfs, global_size_aligned, (LOCAL_WORK_SIZE,))
             exec_event.wait()
 
+            # Read counters back
             cl.enqueue_copy(queue, mapped_uniqueness_np, rule_uniqueness_counts_g, is_blocking=True)
             cl.enqueue_copy(queue, mapped_effectiveness_np, rule_effectiveness_counts_g, is_blocking=True)
 
+            # Update rule scores
             for i in range(num_rules_in_batch):
                 rule_index = rule_start_index + i
                 # Convert to Python int to avoid overflow in rule scores
@@ -1662,33 +1621,55 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
             rule_batch_pbar.update(1)
 
-        # Remove processed rule batches from the list
-        remaining_rule_batches = []
-
-        # Update progress stats for interrupt handler
-        update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
-            
-        # 9. UPDATE AND PREPARE NEXT ITERATION
+        # 8. UPDATE PROGRESS FOR CURRENT WORD BATCH
         words_processed_total += np.uint64(num_words_batch_exec)
         word_batch_pbar.update(num_words_batch_exec)
         word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {int(total_unique_found):,} | Cracked: {int(total_cracked_found):,}]")
+        
+        # Update progress stats for interrupt handler
+        update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
 
-        # Check if we're done (both wordlist and all rule batches processed)
-        if wordlist_processing_complete and not remaining_rule_batches:
-            break
+        # 9. LOAD NEXT WORD BATCH (if available)
+        next_idx = 1 - current_word_buffer_idx
+        
+        if next_batch_available and not wordlist_processing_complete:
+            try:
+                # Try to get next batch
+                next_batch_data = next(word_iterator)
+                base_words_np_next, num_words_batch_next = next_batch_data
+                
+                # Asynchronously copy next batch to GPU while current batch is being processed
+                cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next, is_blocking=False)
+                next_batch_loaded = True
+                
+            except StopIteration:
+                wordlist_processing_complete = True
+                print(f"{green('✅')} {bold('Wordlist fully loaded. Processing final batches...')}")
+                next_batch_loaded = False
+
+        # 10. SWITCH TO NEXT BATCH IF AVAILABLE
+        if next_batch_loaded:
+            # Wait for copy to complete
+            queue.finish()
             
-        # Move to next word batch if available
-        if next_batch_data is not None:
+            # Switch to next buffer
             current_word_buffer_idx = next_idx
             num_words_batch_exec = num_words_batch_next
+            
+            # Reset rule batch progress bar for next word batch
+            rule_batch_pbar.n = 0
+            rule_batch_pbar.refresh()
+            
+            # Continue processing next word batch
+            continue
         elif wordlist_processing_complete:
-            # If wordlist is done but we still have rule batches, we need to reset to process remaining rules
-            # with the current word batch (this handles the case where we have more rule batches than word batches)
-            if remaining_rule_batches:
-                print(f"{blue('🔄')} {bold('Reusing current word batch for remaining rule processing...')}")
-                continue
-            else:
-                break
+            # All word batches processed
+            print(f"{green('✅')} {bold('All word batches processed.')}")
+            break
+        else:
+            # No next batch available yet, wait
+            print(f"{yellow('⚠️')} {bold('No more word batches available.')}")
+            break
 
     word_batch_pbar.close()
     rule_batch_pbar.close()
@@ -1749,7 +1730,7 @@ if __name__ == '__main__':
     print(f"   {green('✓')} {bold('Memory-mapped file loading')}")
     print(f"   {green('✓')} {bold('Fast word count estimation')}")
     print(f"   {green('✓')} {bold('Bulk processing optimization')}")
-    print(f"   {green('✓')} {bold('Parallel hash computation')}")
+    print(f"   {green('✓')} {bold('Continuous rule processing across all word batches')}")
     print(f"{green('=' * 70)}{Colors.END}")
 
     rank_rules_uniqueness_large(
