@@ -156,9 +156,6 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     batch_elements = batch_size * max_len
     words_buffer = np.zeros(batch_elements, dtype=np.uint8)
     
-    load_start = time()
-    total_words_loaded = 0
-    
     try:
         with open(wordlist_path, 'rb') as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -166,51 +163,43 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
                 batch_count = 0
                 file_size = len(mm)
                 
-                # Use a progress bar for loading progress
-                with tqdm(total=file_size, desc="Loading wordlist", unit="B", unit_scale=True, leave=False) as pbar:
-                    while pos < file_size and not interrupted:
-                        # Find next newline efficiently
-                        end_pos = mm.find(b'\n', pos)
-                        if end_pos == -1:
-                            end_pos = file_size
-                        
-                        # Extract line directly from memory map
-                        line = mm[pos:end_pos].strip()
-                        line_len = len(line)
-                        pos = end_pos + 1
-                        pbar.update(pos - pbar.n)  # Update progress
-                        
-                        # Skip empty lines and validate length
-                        if line_len == 0 or line_len > max_len:
-                            continue
-                            
-                        # Copy to buffer
-                        start_idx = batch_count * max_len
-                        end_idx = start_idx + line_len
-                        
-                        # Use memoryview for efficient copying
-                        words_buffer[start_idx:end_idx] = np.frombuffer(line, dtype=np.uint8, count=line_len)
-                        
-                        batch_count += 1
-                        total_words_loaded += 1
-                        
-                        # Yield batch when full
-                        if batch_count >= batch_size:
-                            yield words_buffer, batch_count
-                            batch_count = 0
-                            words_buffer.fill(0)
-                
-                # Yield final partial batch
-                if batch_count > 0 and not interrupted:
-                    yield words_buffer, batch_count
+                while pos < file_size and not interrupted:
+                    # Find next newline efficiently
+                    end_pos = mm.find(b'\n', pos)
+                    if end_pos == -1:
+                        end_pos = file_size
                     
+                    # Extract line directly from memory map
+                    line = mm[pos:end_pos].strip()
+                    line_len = len(line)
+                    pos = end_pos + 1
+                    
+                    # Skip empty lines and validate length
+                    if line_len == 0 or line_len > max_len:
+                        continue
+                        
+                    # Copy to buffer
+                    start_idx = batch_count * max_len
+                    end_idx = start_idx + line_len
+                    
+                    # Use memoryview for efficient copying
+                    words_buffer[start_idx:end_idx] = np.frombuffer(line, dtype=np.uint8, count=line_len)
+                    
+                    batch_count += 1
+                    
+                    # Yield batch when full
+                    if batch_count >= batch_size:
+                        yield words_buffer.copy(), batch_count
+                        batch_count = 0
+                        words_buffer.fill(0)
+            
+            # Yield final partial batch
+            if batch_count > 0 and not interrupted:
+                yield words_buffer.copy(), batch_count
+                
     except Exception as e:
         print(f"{red('❌')} {bold('Error in optimized loader:')} {e}")
         raise
-    
-    load_time = time() - load_start
-    print(f"{green('✅')} {bold('Optimized loading completed:')} {cyan(f'{total_words_loaded:,}')} {bold('words in')} {load_time:.2f}s "
-          f"({total_words_loaded/load_time:,.0f} words/sec)")
 
 # ====================================================================
 # --- INTERRUPT HANDLER FUNCTIONS ---
@@ -371,7 +360,6 @@ def load_cracked_hashes(path, max_len):
         cracked_size = 0
     
     cracked_hashes = []
-    load_start = time()
     
     try:
         # Use optimized loading for cracked list too
@@ -394,11 +382,10 @@ def load_cracked_hashes(path, max_len):
         print(f"{yellow('⚠️')} {bold('Warning:')} Cracked list file not found at: {path}. Effectiveness scores will be zero.")
         return np.array([], dtype=np.uint32)
 
-    load_time = time() - load_start
     unique_hashes = np.unique(np.array(cracked_hashes, dtype=np.uint32))
     
     if cracked_size > 50:
-        print(f"{green('✅')} {bold('Cracked list loaded:')} {cyan(f'{len(unique_hashes):,}')} {bold('unique hashes in')} {load_time:.2f}s")
+        print(f"{green('✅')} {bold('Cracked list loaded:')} {cyan(f'{len(unique_hashes):,}')} {bold('unique hashes')}")
     else:
         print(f"{green('✅')} {bold('Loaded')} {cyan(f'{len(unique_hashes):,}')} {bold('unique cracked password hashes.')}")
         
@@ -1515,11 +1502,11 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     else:
         print(f"{yellow('⚠️')} {bold('Cracked list is empty, effectiveness scoring is disabled.')}")
         
-    # 6. PIPELINED RANKING LOOP SETUP
-    word_iterator = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
+    # 6. MAIN PROCESSING LOOP SETUP
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
+    total_rule_batches = len(rule_batch_starts)
     
-    print(f"{blue('📊')} {bold('Processing')} {cyan(f'{total_rules:,}')} {bold('rules in')} {cyan(f'{len(rule_batch_starts):,}')} {bold('batches')} "
+    print(f"{blue('📊')} {bold('Processing')} {cyan(f'{total_rules:,}')} {bold('rules in')} {cyan(f'{total_rule_batches:,}')} {bold('batches')} "
           f"{bold('(up to')} {cyan(f'{MAX_RULES_IN_BATCH:,}')} {bold('rules per batch)')}")
     
     # Use numpy arrays for counters to avoid overflow
@@ -1530,37 +1517,26 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     mapped_uniqueness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     mapped_effectiveness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     
-    num_words_batch_exec = 0
-    
+    # Main progress bars
     word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist from disk [Unique: 0 | Cracked: 0]", unit=" word")
-    rule_batch_pbar = tqdm(total=len(rule_batch_starts), desc="Rule batches processed", unit=" batch", leave=False)
+    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Rule batches processed", unit=" batch", leave=False)
 
-    # A. Get initial word batch
-    try:
-        base_words_np_batch, num_words_batch_exec = next(word_iterator)
-        # Copy initial batch to GPU
-        cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch).wait()
-    except StopIteration:
-        print(f"{yellow('⚠️')} {bold('Wordlist is empty or too small.')}")
-        word_batch_pbar.close()
-        rule_batch_pbar.close()
-        return
-
-    # B. Main Processing Loop
-    wordlist_processing_complete = False
-    next_batch_available = True
-    next_batch_data = None
-    next_batch_loaded = False
+    # 7. MAIN PROCESSING LOOP - PROCESS ALL WORD BATCHES
+    load_start_time = time()
+    total_words_loaded = 0
     
-    # Process all word batches
-    while True:
-        # Check for interrupt before processing
+    for word_batch_idx, (base_words_np_batch, num_words_batch_exec) in enumerate(optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)):
         if interrupted:
             break
             
-        exec_idx = current_word_buffer_idx
+        # Copy current word batch to GPU
+        cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch).wait()
         
-        # 7. PROCESS ALL RULE BATCHES FOR CURRENT WORD BATCH
+        # Reset rule batch progress bar for each new word batch
+        rule_batch_pbar.n = 0
+        rule_batch_pbar.refresh()
+        
+        # 8. PROCESS ALL RULE BATCHES FOR CURRENT WORD BATCH
         for rule_batch_idx, rule_start_index in enumerate(rule_batch_starts):
             if interrupted:
                 break
@@ -1585,7 +1561,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
             # Set kernel arguments
             kernel_bfs.set_args(
-                base_words_in_g[exec_idx],
+                base_words_in_g[current_word_buffer_idx],
                 rules_in_g,
                 rule_uniqueness_counts_g,
                 rule_effectiveness_counts_g,
@@ -1621,56 +1597,20 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
             rule_batch_pbar.update(1)
 
-        # 8. UPDATE PROGRESS FOR CURRENT WORD BATCH
+        # 9. UPDATE PROGRESS FOR CURRENT WORD BATCH
         words_processed_total += np.uint64(num_words_batch_exec)
+        total_words_loaded += num_words_batch_exec
         word_batch_pbar.update(num_words_batch_exec)
         word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {int(total_unique_found):,} | Cracked: {int(total_cracked_found):,}]")
         
         # Update progress stats for interrupt handler
         update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
 
-        # 9. LOAD NEXT WORD BATCH (if available)
-        next_idx = 1 - current_word_buffer_idx
-        
-        if next_batch_available and not wordlist_processing_complete:
-            try:
-                # Try to get next batch
-                next_batch_data = next(word_iterator)
-                base_words_np_next, num_words_batch_next = next_batch_data
-                
-                # Asynchronously copy next batch to GPU while current batch is being processed
-                cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next, is_blocking=False)
-                next_batch_loaded = True
-                
-            except StopIteration:
-                wordlist_processing_complete = True
-                print(f"{green('✅')} {bold('Wordlist fully loaded. Processing final batches...')}")
-                next_batch_loaded = False
-
-        # 10. SWITCH TO NEXT BATCH IF AVAILABLE
-        if next_batch_loaded:
-            # Wait for copy to complete
-            queue.finish()
-            
-            # Switch to next buffer
-            current_word_buffer_idx = next_idx
-            num_words_batch_exec = num_words_batch_next
-            
-            # Reset rule batch progress bar for next word batch
-            rule_batch_pbar.n = 0
-            rule_batch_pbar.refresh()
-            
-            # Continue processing next word batch
-            continue
-        elif wordlist_processing_complete:
-            # All word batches processed
-            print(f"{green('✅')} {bold('All word batches processed.')}")
-            break
-        else:
-            # No next batch available yet, wait
-            print(f"{yellow('⚠️')} {bold('No more word batches available.')}")
-            break
-
+    load_time = time() - load_start_time
+    if total_words_loaded > 0:
+        words_per_sec = total_words_loaded / load_time
+        print(f"{green('✅')} {bold('Optimized loading completed:')} {cyan(f'{total_words_loaded:,}')} {bold('words in')} {load_time:.2f}s ({words_per_sec:,.0f} words/sec)")
+    
     word_batch_pbar.close()
     rule_batch_pbar.close()
     
